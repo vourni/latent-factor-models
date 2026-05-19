@@ -1,14 +1,4 @@
-"""
-src/data.py
-
-Downloads and prepares data for the latent factor model comparison.
-
-Data sources:
-  - S&P 500 constituents: Wikipedia (current list — survivorship bias applies)
-  - Stock prices: yfinance (adjusted close)
-  - Market return: yfinance (^GSPC)
-  - Risk-free rate: FRED TB3MS (3-month T-bill, annualized %)
-"""
+"""downloads and prepares data for the latent factor model study. sources: S&P 500 tickers from Wikipedia, prices/market from yfinance, risk-free from FRED."""
 
 import time
 import warnings
@@ -21,30 +11,18 @@ from typing import Tuple
 
 warnings.filterwarnings("ignore")
 
-# ── constants ──────────────────────────────────────────────────────────────────
 START_DATE = "1980-01-01"
 END_DATE   = "2024-12-31"
-MIN_MONTHS = 60          
-MAX_FILL   = 3           
+MIN_MONTHS = 60          # minimum valid monthly observations to keep a stock
+MAX_FILL   = 3           # max consecutive NaN months to forward-fill
 TRAIN_END  = "2009-12-31"
 VAL_END    = "2014-12-31"
-# test: 2015-01-01 → 2024-12-31
+# test window: 2015-01-01 → 2024-12-31
 
 
-# ── ticker download ────────────────────────────────────────────────────────────
-
+# survivorship bias note: this uses the *current* S&P 500 list, so delisted names are missing
 def get_sp500_tickers() -> list[str]:
-    """
-    Scrape the current S&P 500 constituent list from Wikipedia.
-
-    NOTE ON SURVIVORSHIP BIAS: This is the *current* S&P 500 membership.
-    Companies that were delisted, merged, or removed from the index between
-    1980 and today are absent.  This overstates average returns and understates
-    volatility relative to the true investable universe.  All results should
-    be interpreted with this caveat.
-
-    Returns a list of ticker strings adjusted for yfinance (dots → dashes).
-    """
+    """scrapes current S&P 500 tickers from Wikipedia. returns list of ticker strings."""
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"}
     resp = requests.get(url, headers=headers, timeout=30)
@@ -55,28 +33,9 @@ def get_sp500_tickers() -> list[str]:
     return [t.replace(".", "-") for t in tickers]
 
 
-# ── price download ─────────────────────────────────────────────────────────────
-
 def download_monthly_returns(tickers: list[str],
                               ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Download adjusted-close prices for *tickers* and return monthly prices and
-    returns.
-
-    Steps:
-      1. Download daily adjusted close via yfinance in batches.
-      2. Resample to month-end prices.
-      3. Compute simple monthly returns: r_t = P_t / P_{t-1} - 1.
-      4. Forward-fill up to MAX_FILL consecutive missing values (handles short
-         holidays / data gaps), then drop any stock with fewer than MIN_MONTHS
-         valid observations.
-
-    Returns
-    -------
-    prices  : pd.DataFrame  shape (T_months, N_stocks) month-end adjusted close
-    returns : pd.DataFrame  shape (T_months, N_stocks) simple monthly returns
-    Both share the same index and columns.
-    """
+    """downloads monthly prices and returns for given tickers. returns (prices df, returns df)."""
     print(f"Downloading prices for {len(tickers)} tickers …")
     batch_size = 100
     monthly_px_list = []
@@ -120,18 +79,7 @@ def download_monthly_returns(tickers: list[str],
 
 
 def download_market_and_rf() -> Tuple[pd.Series, pd.Series]:
-    """
-    Download the market excess return and the risk-free rate.
-
-    Market: ^GSPC monthly returns (used for beta estimation).
-    Risk-free: FRED TB3MS — 3-month T-bill annualized percentage, converted to
-               monthly decimal: r_f_monthly = (1 + r_f_annual/100)^(1/12) - 1
-
-    Returns
-    -------
-    mkt_ret : pd.Series  monthly simple returns of ^GSPC
-    rf      : pd.Series  monthly decimal risk-free rate
-    """
+    """downloads ^GSPC monthly returns and FRED TB3MS risk-free rate. returns (mkt_ret, rf)."""
     print("Downloading market index (^GSPC) …")
     gspc = yf.download("^GSPC", start=START_DATE, end=END_DATE,
                        auto_adjust=True, progress=False)["Close"]
@@ -159,36 +107,10 @@ def download_market_and_rf() -> Tuple[pd.Series, pd.Series]:
     return mkt_ret, rf
 
 
-# ── shares outstanding ────────────────────────────────────────────────────────
-
 def download_shares_outstanding(tickers: list[str],
                                  cache_path: str = "data/raw/shares_cache.pkl",
                                  ) -> pd.DataFrame:
-    """
-    Download monthly shares outstanding for each ticker.
-
-    For each ticker, attempts get_shares_full() for a full historical time series
-    of share counts (captures buybacks, issuances, and splits).  Falls back to
-    Ticker.info['sharesOutstanding'] (current value only) if that fails.
-
-    NOTE ON APPROXIMATION: tickers that fall back to the current scalar value
-    have their shares outstanding held constant at that value across the entire
-    history.  This ignores historical buybacks and issuances and introduces
-    measurement error for the training period.  It is unavoidable without a paid
-    data source.  The characteristic remains informative because large-cap stocks
-    tend to stay large-cap and small-cap stocks tend to stay small-cap over
-    multi-year horizons.
-
-    NOTE ON SPLIT CONSISTENCY: adjusted close prices account for splits by
-    reducing the historical price by the split ratio.  get_shares_full() reports
-    actual share counts, which increase at split dates by the same ratio.  The
-    product price × shares (market cap) is therefore consistent across split
-    dates — the split adjustment cancels.
-
-    Returns
-    -------
-    pd.DataFrame  shape (T_months, N_tickers), month-end dates, shares outstanding
-    """
+    """downloads monthly shares outstanding per ticker; falls back to current scalar if history unavailable. returns (T_months, N_tickers) df."""
     import os, pickle
 
     if os.path.exists(cache_path):
@@ -247,22 +169,10 @@ def download_shares_outstanding(tickers: list[str],
     return df
 
 
-# ── daily data download ───────────────────────────────────────────────────────
-
 def download_daily_data(tickers: list[str],
                         cache_path: str = "data/raw/daily_cache.pkl",
                         ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Download daily adjusted-close prices and volume for *tickers*.
-
-    Used to compute daily-frequency characteristics: vol1, max_ret, min_ret,
-    high52, skew1, skew3, amihud, and turn1.
-
-    Returns
-    -------
-    daily_prices : pd.DataFrame  shape (T_days, N_stocks)  adjusted close
-    daily_volume : pd.DataFrame  shape (T_days, N_stocks)  shares traded per day
-    """
+    """downloads daily adjusted-close and volume; used for vol1, max_ret, amihud, etc. returns (daily_prices, daily_volume)."""
     import os, pickle
 
     if os.path.exists(cache_path):
@@ -313,8 +223,6 @@ def download_daily_data(tickers: list[str],
     return daily_prices, daily_volume
 
 
-# ── characteristics ────────────────────────────────────────────────────────────
-
 def compute_characteristics(returns: pd.DataFrame,
                              mkt_ret: pd.Series,
                              rf: pd.Series,
@@ -323,56 +231,7 @@ def compute_characteristics(returns: pd.DataFrame,
                              daily_prices: pd.DataFrame = None,
                              daily_volume: pd.DataFrame = None,
                              ) -> np.ndarray:
-    """
-    Compute 21 firm characteristics for each stock-month pair.
-
-    All characteristics are *lagged by one month* before use: the value
-    assigned to month t is computed using data through month t-1 (and earlier),
-    so there is no lookahead bias when predicting returns at t.
-
-    Monthly characteristics (computed at t-1, used to predict r_t):
-      [0]  mom1     : 1-month lagged return (short-term reversal)
-      [1]  mom6     : cumulative return [t-7, t-2]
-      [2]  mom12    : cumulative return [t-13, t-2]
-      [3]  vol12    : 12-month return std-dev
-      [4]  beta12   : 12-month OLS market beta
-      [5]  ivol12   : 12-month idiosyncratic vol (residual std, ddof=2)
-      [6]  mktcap   : log(price_{t-1} × shares_{t-1})
-      [7]  mom3     : cumulative return [t-4, t-2] (3-month momentum)
-      [8]  mom9     : cumulative return [t-10, t-2] (9-month momentum)
-      [9]  mom36    : cumulative return [t-37, t-13] (long-run reversal, t≥37)
-      [11] vol6     : 6-month return std-dev
-      [12] beta36   : 36-month OLS market beta (t≥36)
-      [13] beta_down: downside beta from 60-month window, ≥12 negative mkt months
-
-    Daily characteristics (require daily_prices and daily_volume):
-      [10] vol1     : daily vol over 21-day window × √21 (monthly-scale units)
-      [14] max_ret  : max daily return in 21-day window
-      [15] min_ret  : min daily return in 21-day window
-      [16] high52   : price / 52-week high (252-day window; requires t1 ≥ 252)
-      [17] skew1    : 21-day daily return skewness (unbiased, ≥5 obs)
-      [18] skew3    : 63-day daily return skewness (unbiased, ≥15 obs)
-      [19] amihud   : Amihud (2002) illiquidity ×1e6 (252-day, ≥60 valid days)
-      [20] turn1    : mean daily turnover (vol/shares) over 21-day window
-
-    After computing raw values each characteristic is cross-sectionally
-    rank-normalised to [-1, 1] each month (Kelly, Pruitt & Su 2019;
-    Gu, Kelly & Xiu 2021).
-
-    Parameters
-    ----------
-    returns      : pd.DataFrame  (T, N)     monthly excess returns
-    mkt_ret      : pd.Series     (T,)       monthly market return
-    rf           : pd.Series     (T,)       monthly risk-free rate
-    prices       : pd.DataFrame  (T, N)     month-end adjusted close (mktcap)
-    shares       : pd.DataFrame  (T, N)     month-end shares outstanding
-    daily_prices : pd.DataFrame  (T_days, N) daily adjusted close (optional)
-    daily_volume : pd.DataFrame  (T_days, N) daily volume in shares (optional)
-
-    Returns
-    -------
-    chars : np.ndarray  shape (N, T, 21)  — NaN where data is unavailable
-    """
+    """computes 21 lagged firm characteristics (momentum, vol, beta, mktcap, daily stats) and cross-sectionally rank-normalizes each to [-1, 1]. returns (N, T, 21) array."""
     T, N = returns.shape
     dates   = returns.index
     tickers = returns.columns
@@ -386,7 +245,7 @@ def compute_characteristics(returns: pd.DataFrame,
 
     chars_raw = np.full((T, N, 21), np.nan)
 
-    # ── [6] mktcap: log(price_{t-1} × shares_{t-1}) ──────────────────────────
+    # [6] mktcap: log(price * shares), both lagged one month
     if prices is not None and shares is not None:
         prices_aligned = prices.reindex(returns.index).reindex(
             columns=returns.columns)
@@ -399,7 +258,7 @@ def compute_characteristics(returns: pd.DataFrame,
             log_mktcap = np.where(mktcap_raw > 1, np.log(mktcap_raw), np.nan)
         chars_raw[:, :, 6] = log_mktcap
 
-    # ── pre-process daily data ─────────────────────────────────────────────────
+    # pre-process daily data into arrays for fast monthly indexing
     have_daily = daily_prices is not None and daily_volume is not None
     if have_daily:
         dp = daily_prices.reindex(columns=tickers).ffill(limit=5)
@@ -427,11 +286,11 @@ def compute_characteristics(returns: pd.DataFrame,
         daily_idx_arr = dp_arr = dv_arr = dr_arr = None
         monthly_dates_arr = shares_arr = None
 
-    # ── excess returns for beta ────────────────────────────────────────────────
+    # excess returns used for beta/ivol calculations
     exc_ret = ret - rf_arr[:, None]   # (T, N)
     mkt_exc = mkt - rf_arr            # (T,)
 
-    # ── monthly loop ──────────────────────────────────────────────────────────
+    # main monthly loop — compute each characteristic at t using data through t-1
     for t in range(13, T):
 
         # [0] mom1
@@ -503,7 +362,7 @@ def compute_characteristics(returns: pd.DataFrame,
                              - np.nanmean(ew_d, axis=0) * np.nanmean(mw_d))
                     chars_raw[t, :, 13] = cov_d / mv_d
 
-        # ── daily characteristics ──────────────────────────────────────────────
+        # daily characteristics (skipped if daily data not provided)
         if not have_daily:
             continue
 
@@ -566,7 +425,7 @@ def compute_characteristics(returns: pd.DataFrame,
                     sh_tm1[None, :] > 0, dv_21 / sh_tm1[None, :], np.nan)
             chars_raw[t, :, 20] = np.nanmean(daily_turn, axis=0)
 
-    # ── cross-sectional rank normalisation to [-1, 1] ─────────────────────────
+    # cross-sectional rank normalization to [-1, 1] each month
     P_total    = chars_raw.shape[2]
     chars_norm = np.full_like(chars_raw, np.nan)
     for t in range(T):
@@ -587,23 +446,10 @@ def compute_characteristics(returns: pd.DataFrame,
     return chars_out
 
 
-# ── train / val / test split ───────────────────────────────────────────────────
-
 def time_split(returns: pd.DataFrame,
                chars: np.ndarray
                ) -> dict:
-    """
-    Split returns and characteristics strictly by calendar time.
-
-    Train : 1980-01-01 – 2009-12-31
-    Val   : 2010-01-01 – 2014-12-31
-    Test  : 2015-01-01 – 2024-12-31
-
-    No shuffling — future data must never appear in an earlier split.
-
-    Returns a dict with keys 'train', 'val', 'test', each containing
-    {'returns': DataFrame, 'chars': ndarray (N, T_split, P)}.
-    """
+    """splits returns and chars into train/val/test by calendar date; no shuffling. returns dict with keys 'train', 'val', 'test'."""
     dates = returns.index
     train_mask = dates <= TRAIN_END
     val_mask   = (dates > TRAIN_END) & (dates <= VAL_END)
@@ -625,35 +471,8 @@ def time_split(returns: pd.DataFrame,
     return splits
 
 
-# ── master loader ──────────────────────────────────────────────────────────────
-
 def load_data(cache_path: str = "data/raw/data_cache.pkl") -> dict:
-    """
-    Full data pipeline:
-      1. Get S&P 500 tickers.
-      2. Download monthly prices and compute returns.
-      3. Download market return and risk-free rate.
-      4. Download shares outstanding (cached separately).
-      5. Download daily prices and volume (cached separately).
-      6. Compute excess returns.
-      7. Compute and rank-normalise P=21 firm characteristics
-         (mom1, mom3, mom6, mom9, mom12, mom36, vol6, vol12, beta12, beta36,
-          beta_down, ivol12, mktcap, vol1, max_ret, min_ret, high52,
-          skew1, skew3, amihud, turn1).
-      8. Split into train / val / test.
-
-    Results are cached to *cache_path* to avoid re-downloading on repeated
-    runs.  Delete the cache file to force a fresh download.
-
-    Returns
-    -------
-    dict with keys:
-      'splits'  : dict from time_split()
-      'returns' : full returns DataFrame (T, N), excess returns
-      'chars'   : full characteristics array (N, T, P=21)
-      'dates'   : DatetimeIndex of month-end dates
-      'tickers' : list of stock tickers
-    """
+    """runs the full data pipeline (tickers → returns → chars → splits) and caches the result. returns dict with keys 'splits', 'returns', 'chars', 'dates', 'tickers'."""
     import os, pickle
 
     if os.path.exists(cache_path):
