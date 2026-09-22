@@ -403,7 +403,7 @@ class CAEModel:
     use_linear: bool, freeze_linear: bool, device: str}."""
 
     def __init__(self,
-                 n_chars: int = 21,
+                 n_chars: int = 19,
                  n_factors: int = 5,
                  lam_lin: float = 0.0,
                  lam_nonlin: float = 0.0,
@@ -498,9 +498,10 @@ class CAEModel:
         return float(np.linalg.norm(W - gamma, "fro") / denom)
 
     def l1_penalty(self) -> torch.Tensor:
-        """L1 regularisation on decoder weights with separate lambdas for W_skip and g.
-        separate lambdas prevent g being over-penalised relative to W_skip due to
-        parameter count differences. returns scalar tensor."""
+        """L1 penalties on W_skip and all g parameters, including g biases.
+        Separate lambdas allow different penalties but do not normalize branch sizes.
+        Returns a scalar tensor.
+        """
         if self.lam_lin > 0 and not self.use_linear:
             import warnings
             warnings.warn(
@@ -528,39 +529,18 @@ class CAEModel:
                                 torch.Tensor, torch.Tensor]:
         """builds (managed, z_stocks, r_true, mask) tensors for a mini-batch of time indices.
         NaNs zeroed out; mask tracks valid stocks per t. returns tensors on self.device."""
-        T_b  = len(t_indices)
-        T, N = returns.shape       # full time × stocks
-        P    = chars.shape[2]      # characteristics per stock
-
-        managed_np  = np.zeros((T_b, P), dtype=np.float32)
-        z_np        = np.zeros((T_b, N, P), dtype=np.float32)
-        r_np        = np.zeros((T_b, N), dtype=np.float32)
-        mask_np     = np.zeros((T_b, N), dtype=np.float32)
-
-        for b, t in enumerate(t_indices):
-            r_t = returns[t, :]      # (N,)  — NaN where missing
-            z_t = chars[:, t, :]     # (N, P) — NaN where missing
-
-            valid = np.isfinite(r_t) & np.isfinite(z_t).all(axis=1)
-            mask_np[b, valid] = 1.0
-
-            r_clean = np.nan_to_num(r_t, nan=0.0)
-            z_clean = np.nan_to_num(z_t, nan=0.0)
-
-            # divide by N_t to normalise for varying cross-section size across time
-            n_valid = valid.sum()
-            managed_np[b] = (z_clean[valid].T @ r_t[valid] / n_valid
-                             if n_valid > 0 else np.zeros(P))
-
-            z_np[b]   = z_clean
-            r_np[b]   = r_clean
-
-        managed  = _to_tensor(managed_np,  self.device)
-        z_stocks = _to_tensor(z_np,        self.device)
-        r_true   = _to_tensor(r_np,        self.device)
-        mask     = _to_tensor(mask_np,     self.device)
-
-        return managed, z_stocks, r_true, mask
+        cached = getattr(self, "_training_batches", {}).get((id(returns), id(chars)))
+        if cached is not None:
+            return tuple(tensor[t_indices] for tensor in cached)
+        r = returns[t_indices]
+        z = chars[:, t_indices, :].transpose(1, 0, 2)
+        valid = np.isfinite(r) & np.isfinite(z).all(axis=2)
+        r_clean = np.where(np.isfinite(r), r, 0).astype(np.float32)
+        z_clean = np.where(np.isfinite(z), z, 0).astype(np.float32)
+        managed = np.einsum("tnp,tn->tp", z_clean, np.where(valid, r_clean, 0))
+        managed /= np.maximum(valid.sum(axis=1, keepdims=True), 1)
+        return (_to_tensor(managed, self.device), _to_tensor(z_clean, self.device),
+                _to_tensor(r_clean, self.device), _to_tensor(valid.astype(np.float32), self.device))
 
     def get_factors(self,
                     returns: np.ndarray,
@@ -654,7 +634,7 @@ class CAEModel:
                 # when frozen, W_skip = Gamma_IPCA throughout, so var_lin = IPCA's loading variance
                 beta_lin = self.net.decoder.W_skip(z_flat)
             else:
-                # NL-only: no linear branch, so var_lin = 0 and frac_nonlin = 1.0 always
+                # NL-only: no linear branch; phi is undefined if g has zero variance.
                 beta_lin = torch.zeros_like(beta_nonlin)
 
         mask_flat = mask.reshape(-1).cpu().numpy().astype(bool)

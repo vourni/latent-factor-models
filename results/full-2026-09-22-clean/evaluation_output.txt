@@ -1,0 +1,142 @@
+Run directory: results/full-2026-09-22-clean
+Empirical data run
+Loading cached data from data/raw/data_cache_v4.pkl …
+  K=2: ensemble R²=0.01737; individual-seed mean=0.01715, best=0.01762
+  K=3: ensemble R²=0.01644; individual-seed mean=0.01591, best=0.01659
+  K=5: ensemble R²=0.01699; individual-seed mean=0.01660, best=0.01759
+  K=8: ensemble R²=0.01730; individual-seed mean=0.01688, best=0.01747
+  K=10: ensemble R²=0.01713; individual-seed mean=0.01689, best=0.01741
+  Best-seed test scores are descriptive only; seeds are not selected on the test set.
+
+=== Evaluation on the common characteristic-complete test panel ===
+    Bootstrap Sharpe: dropped 120 NaN months.
+    WARNING: bootstrap Sharpe has only 0 valid months — results are unreliable.
+    Bootstrap Sharpe: dropped 120 NaN months.
+    WARNING: bootstrap Sharpe has only 0 valid months — results are unreliable.
+    Bootstrap Sharpe: dropped 120 NaN months.
+    WARNING: bootstrap Sharpe has only 0 valid months — results are unreliable.
+    Bootstrap Sharpe: dropped 120 NaN months.
+    WARNING: bootstrap Sharpe has only 0 valid months — results are unreliable.
+    Bootstrap Sharpe: dropped 120 NaN months.
+    WARNING: bootstrap Sharpe has only 0 valid months — results are unreliable.
+
+--- Diebold-Mariano Results  (positive DM = first named model better) ---
+  PRIMARY: ResCAE vs IPCA — does the residual architecture improve forecasts?
+Comparison                   K       DM        p  sig
+-----------------------------------------------------
+ResCAE vs IPCA [PRIMARY]     2    1.382   0.1670     
+ResCAE vs PCA                2    1.118   0.2636     
+ResCAE vs CAE-NL             2    1.834   0.0666    *
+ResCAE vs IPCA [PRIMARY]     3    1.285   0.1987     
+ResCAE vs PCA                3    0.680   0.4968     
+ResCAE vs CAE-NL             3    1.374   0.1694     
+ResCAE vs IPCA [PRIMARY]     5    1.280   0.2005     
+ResCAE vs PCA                5    0.701   0.4833     
+ResCAE vs CAE-NL             5    1.947   0.0515    *
+ResCAE vs IPCA [PRIMARY]     8    1.384   0.1663     
+ResCAE vs PCA                8    0.672   0.5013     
+ResCAE vs CAE-NL             8    2.048   0.0406   **
+ResCAE vs IPCA [PRIMARY]    10    1.363   0.1727     
+ResCAE vs PCA               10    0.576   0.5650     
+ResCAE vs CAE-NL            10    2.150   0.0316   **
+
+  FIXED PRIMARY: ResCAE-Fixed vs IPCA — does the frozen-linear architecture improve forecasts?
+ResCAE-Fixed vs IPCA [PRI-F]     2    0.562   0.5742     
+ResCAE-Fixed vs PCA              2   -0.592   0.5540     
+ResCAE-Fixed vs IPCA [PRI-F]     3    0.767   0.4428     
+ResCAE-Fixed vs PCA              3   -0.355   0.7223     
+ResCAE-Fixed vs IPCA [PRI-F]     5    0.529   0.5967     
+ResCAE-Fixed vs PCA              5   -0.559   0.5760     
+ResCAE-Fixed vs IPCA [PRI-F]     8    0.513   0.6080     
+ResCAE-Fixed vs PCA              8   -0.703   0.4819     
+ResCAE-Fixed vs IPCA [PRI-F]    10    0.630   0.5288     
+ResCAE-Fixed vs PCA             10   -0.569   0.5693     
+
+  FIXED SECONDARY: ResCAE vs ResCAE-Fixed — does relaxing W_skip help?
+ResCAE vs ResCAE-Fixed [SEC]     2    1.342   0.1795     
+ResCAE vs ResCAE-Fixed [SEC]     3    0.968   0.3329     
+ResCAE vs ResCAE-Fixed [SEC]     5    1.238   0.2156     
+ResCAE vs ResCAE-Fixed [SEC]     8    1.448   0.1475     
+ResCAE vs ResCAE-Fixed [SEC]    10    1.241   0.2145     
+
+--- Bootstrap Sharpe Test Results ---
+Comparison                   K    SR1    SR2     ΔSR       p               CI 95%  sig
+--------------------------------------------------------------------------------------
+ResCAE vs IPCA [PRIMARY]     2  0.502  0.525  -0.024  0.7762      [-0.195, 0.140]     
+ResCAE vs PCA                2  0.502  0.437   0.065  0.7502      [-0.349, 0.487]     
+ResCAE vs IPCA [PRIMARY]     3  0.588  0.610  -0.022  0.9041      [-0.377, 0.265]     
+ResCAE vs PCA                3  0.588  0.438   0.150  0.4496      [-0.291, 0.505]     
+ResCAE vs IPCA [PRIMARY]     5  0.928  0.819   0.108  0.5964      [-0.263, 0.544]     
+ResCAE vs PCA                5  0.928  0.432   0.496  0.0539       [0.023, 1.053]    *
+ResCAE vs IPCA [PRIMARY]     8  0.710  0.829  -0.119  0.4605      [-0.440, 0.157]     
+ResCAE vs PCA                8  0.710  0.608   0.102  0.6943      [-0.380, 0.607]     
+ResCAE vs IPCA [PRIMARY]    10  0.772  0.743   0.029  0.8811      [-0.365, 0.380]     
+ResCAE vs PCA               10  0.772  0.714   0.058  0.8442      [-0.624, 0.628]     
+ResCAE-Fixed vs IPCA [PRI-F]     2  0.532  0.525   0.007  0.7453      [-0.034, 0.047]     
+ResCAE vs ResCAE-Fixed [SEC]     2  0.502  0.532  -0.030  0.6863      [-0.183, 0.121]     
+ResCAE-Fixed vs IPCA [PRI-F]     3  0.582  0.610  -0.028  0.6663      [-0.154, 0.094]     
+ResCAE vs ResCAE-Fixed [SEC]     3  0.588  0.582   0.006  0.9610      [-0.304, 0.253]     
+ResCAE-Fixed vs IPCA [PRI-F]     5  0.685  0.819  -0.135  0.3247      [-0.398, 0.126]     
+ResCAE vs ResCAE-Fixed [SEC]     5  0.928  0.685   0.243  0.1089      [-0.046, 0.551]     
+ResCAE-Fixed vs IPCA [PRI-F]     8  0.764  0.829  -0.065  0.6064      [-0.329, 0.161]     
+ResCAE vs ResCAE-Fixed [SEC]     8  0.710  0.764  -0.054  0.5844      [-0.243, 0.146]     
+ResCAE-Fixed vs IPCA [PRI-F]    10  0.797  0.743   0.054  0.6953      [-0.237, 0.328]     
+ResCAE vs ResCAE-Fixed [SEC]    10  0.772  0.797  -0.025  0.8372      [-0.271, 0.214]     
+
+  Significance results → results/full-2026-09-22-clean/significance_tests.pkl
+  → results/full-2026-09-22-clean/plots/dm_test_results.png
+  → results/full-2026-09-22-clean/plots/r2_bootstrap_ci.png
+  → results/full-2026-09-22-clean/plots/residual_improvement.png
+  → results/full-2026-09-22-clean/plots/factor_portfolio_cumret.png
+  → results/full-2026-09-22-clean/plots/phi_decomposition.png
+  → results/full-2026-09-22-clean/plots/fixed_vs_free_comparison.png
+  → results/full-2026-09-22-clean/plots/loss_curves.png
+  → results/full-2026-09-22-clean/plots/summary_heatmap.png
+  → results/full-2026-09-22-clean/plots/ipca_drift.png
+  → results/full-2026-09-22-clean/plots/lambda_interaction_phi.png
+  → results/full-2026-09-22-clean/plots/lambda_interaction_r2.png
+  phi_decomposition_analysis: fewer than 3 diagonal configurations available; skipping.
+  → results/full-2026-09-22-clean/plots/seed_stability.png
+Seed stability at validation-selected configurations (test metrics):
+                  pred_r2              sharpe                     phi                   drift          
+                     mean       std      mean       std          mean           std      mean       std
+Model        K                                                                                         
+CAE-NL       2   0.014858  0.000577       NaN       NaN           NaN           NaN       NaN       NaN
+             3   0.014529  0.000929       NaN       NaN           NaN           NaN       NaN       NaN
+             5   0.014765  0.000442       NaN       NaN           NaN           NaN       NaN       NaN
+             8   0.014173  0.001191       NaN       NaN           NaN           NaN       NaN       NaN
+             10  0.013327  0.001266       NaN       NaN           NaN           NaN       NaN       NaN
+ResCAE       2   0.017155  0.000402  0.496662  0.014589  1.163416e-06  1.078524e-06  0.916646  0.028039
+             3   0.015908  0.000835  0.612421  0.121993  2.586275e-07  2.453864e-07  0.860330  0.092584
+             5   0.016598  0.001176  0.820986  0.222180  1.402678e-07  8.607461e-08  0.844975  0.055341
+             8   0.016879  0.000519  0.748131  0.069389  2.070376e-07  1.720103e-07  0.840641  0.109620
+             10  0.016894  0.000480  0.747360  0.073938  4.769977e-08  1.824325e-08  0.845214  0.018922
+ResCAE-Fixed 2   0.009870  0.004388  0.522584  0.013989  8.401607e-08  1.029969e-07  0.000000  0.000000
+             3   0.012494  0.002435  0.574028  0.023137  7.372149e-08  4.717452e-08  0.000000  0.000000
+             5   0.009493  0.001512  0.693810  0.110303  1.245227e-01  8.517273e-02  0.000000  0.000000
+             8   0.007224  0.004558  0.738034  0.066388  1.154221e-01  1.791274e-02  0.000000  0.000000
+             10  0.008640  0.003676  0.778338  0.132630  4.074604e-02  1.370340e-02  0.000000  0.000000
+
+Summary: results/full-2026-09-22-clean/summary_table.csv
+
+RESULTS — 2015-01 to 2024-12 (120 months)
+Representative ResCAE chosen on validation data: (8, 0.1, 5e-05)
+              Model  K   Pred_R2    Sharpe      NL_frac  drift_rel
+                PCA  8  0.015162  0.608101          NaN        NaN
+               IPCA  8 -0.000399  0.829139          NaN        NaN
+                 AE  8 -0.003303 -0.264582          NaN        NaN
+       ResCAE-Fixed  8  0.009011  0.764343 1.157099e-01   0.000000
+             ResCAE  8  0.017304  0.710268 1.000616e-07   0.840641
+CAE-NL (robustness)  8  0.014282       NaN          NaN        NaN
+
+DM tests: positive statistic favors the first named model; two-sided p-values.
+  ResCAE vs IPCA: DM=1.384, p=0.1663, Holm p across K=0.8317
+  ResCAE vs PCA: DM=0.672, p=0.5013, Holm p across K=1.0000
+  ResCAE-Fixed vs IPCA: DM=0.513, p=0.6080, Holm p across K=1.0000
+  ResCAE vs ResCAE-Fixed: DM=1.448, p=0.1475, Holm p across K=0.7376
+
+Predictive R² and portfolio Sharpe measure different objectives.
+ResCAE-Fixed freezes W_skip; its encoder and nonlinear branch both train.
+The comparison does not isolate nonlinearity with fixed factors.
+φ is a branch variance ratio excluding covariance; it is not explained return variance.
+Flat predictions provide no stock ranking; this does not validate an architecture.

@@ -3,6 +3,7 @@
 /.venv
 /.vscode
 /data
+/docs
 __pycache__/
 *.py[cod]
 .DS_Store

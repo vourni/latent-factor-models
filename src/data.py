@@ -1,6 +1,5 @@
 """downloads and prepares data for the latent factor model study. sources: S&P 500 tickers from Wikipedia, prices/market from yfinance, risk-free from FRED."""
 
-import time
 import warnings
 import requests
 import numpy as np
@@ -11,18 +10,30 @@ from typing import Tuple
 
 START_DATE = "1980-01-01"
 END_DATE   = "2024-12-31"
-DOWNLOAD_END = "2025-01-01"  # Yahoo's end date is exclusive.
-CACHE_VERSION = 2
+DOWNLOAD_END = (pd.Timestamp(END_DATE) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+CACHE_VERSION = 4
+# Do not join predecessor units to reorganized common shares. NVR's filing:
+# https://www.sec.gov/Archives/edgar/data/906163/000095012310100067/w79957e10vq.htm
+PRICE_HISTORY_STARTS = {"NVR": "1993-10-01"}
 CHAR_NAMES = [
-    "mom1", "mom6", "mom12", "vol12", "beta12", "ivol12", "log_mktcap",
-    "mom3", "mom9", "mom36", "vol1", "vol6", "beta36", "beta_down",
-    "max_ret", "min_ret", "high52", "skew1", "skew3", "amihud", "turn1",
+    "mom1", "mom6", "mom12", "vol12", "beta12", "ivol12",
+    "mom3", "mom9", "mom24_13", "vol1", "vol6", "beta36", "beta_down",
+    "max_ret", "min_ret", "high52", "skew1", "skew3", "amihud",
 ]
-MIN_MONTHS = 60          # minimum valid monthly observations to keep a stock
+MIN_MONTHS = 60          # minimum valid TRAINING observations to keep a stock
 MAX_FILL   = 3           # max consecutive NaN months to forward-fill
 TRAIN_END  = "2009-12-31"
 VAL_END    = "2014-12-31"
 # test window: 2015-01-01 → 2024-12-31
+
+
+def clean_price_history(prices: pd.DataFrame, volume: pd.DataFrame) -> pd.DataFrame:
+    """Exclude non-trading placeholders and a known security-identity boundary."""
+    cleaned = prices.where(volume.reindex_like(prices) > 0).copy()
+    for ticker, start in PRICE_HISTORY_STARTS.items():
+        if ticker in cleaned:
+            cleaned.loc[cleaned.index < start, ticker] = np.nan
+    return cleaned
 
 
 # survivorship bias note: this uses the *current* S&P 500 list, so delisted names are missing
@@ -48,17 +59,20 @@ def download_monthly_returns(tickers: list[str],
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i : i + batch_size]
         try:
-            raw = yf.download(
+            downloaded = yf.download(
                 batch,
                 start=START_DATE,
                 end=DOWNLOAD_END,
                 auto_adjust=True,
                 progress=False,
                 threads=True,
-            )["Close"]
+            )
+            raw, volume = downloaded["Close"], downloaded["Volume"]
             # Ensure DataFrame even for a single ticker
             if isinstance(raw, pd.Series):
                 raw = raw.to_frame(name=batch[0])
+                volume = volume.to_frame(name=batch[0])
+            raw = clean_price_history(raw, volume)
             monthly_px = raw.resample("ME").last()
             monthly_px_list.append(monthly_px)
         except Exception as e:
@@ -74,7 +88,7 @@ def download_monthly_returns(tickers: list[str],
     returns = prices_filled.pct_change(fill_method=None).iloc[1:]
 
     # Drop stocks with too few observations
-    valid_counts = returns.notna().sum(axis=0)
+    valid_counts = returns.loc[:TRAIN_END].notna().sum(axis=0)
     keep = valid_counts[valid_counts >= MIN_MONTHS].index
     returns = returns[keep]
 
@@ -114,72 +128,8 @@ def download_market_and_rf() -> Tuple[pd.Series, pd.Series]:
     return mkt_ret, rf
 
 
-def download_shares_outstanding(tickers: list[str],
-                                 cache_path: str = "data/raw/shares_cache_v2.pkl",
-                                 ) -> pd.DataFrame:
-    """downloads monthly shares outstanding per ticker; falls back to current scalar if history unavailable. returns (T_months, N_tickers) df."""
-    import os, pickle
-
-    if os.path.exists(cache_path):
-        print(f"Loading cached shares data from {cache_path} …")
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
-
-    n = len(tickers)
-    print(f"Downloading shares outstanding for {n} tickers …")
-    all_months = pd.date_range(START_DATE, END_DATE, freq="ME")
-    shares_dict: dict = {}
-    batch_size = 50
-
-    for i in range(0, n, batch_size):
-        batch = tickers[i : i + batch_size]
-        print(f"  Downloading shares outstanding: {i}/{n}")
-
-        for ticker in batch:
-            try:
-                tkr = yf.Ticker(ticker)
-                shares_ts = tkr.get_shares_full(start=START_DATE)
-                if shares_ts is not None and len(shares_ts) > 0:
-                    # Resample to month-end, forward-fill gaps within the series,
-                    # then reindex to the full monthly grid and forward-fill again.
-                    shares_ts.index = shares_ts.index.tz_localize(None)
-                    s = shares_ts.resample("ME").last().ffill()
-                    s = s.reindex(all_months, method="ffill")
-                    shares_dict[ticker] = s
-                else:
-                    raise ValueError("empty series")
-            except Exception:
-                # Fall back to current scalar from .info; broadcast across all
-                # dates. This introduces look-ahead bias; retained as an explicit
-                # limitation of this exploratory dataset, not point-in-time data.
-                try:
-                    current = yf.Ticker(ticker).info.get("sharesOutstanding", None)
-                    if current is not None:
-                        shares_dict[ticker] = pd.Series(
-                            float(current), index=all_months)
-                    else:
-                        shares_dict[ticker] = pd.Series(np.nan, index=all_months)
-                except Exception:
-                    shares_dict[ticker] = pd.Series(np.nan, index=all_months)
-
-        if i + batch_size < n:
-            time.sleep(0.5)
-
-    print(f"  Downloading shares outstanding: {n}/{n}")
-    df = pd.DataFrame(shares_dict, index=all_months)
-
-    cache_dir = os.path.dirname(cache_path)
-    if cache_dir:
-        os.makedirs(cache_dir, exist_ok=True)
-    with open(cache_path, "wb") as f:
-        pickle.dump(df, f)
-    print(f"  Shares data cached to {cache_path}.")
-
-    return df
-
-
 def download_daily_data(tickers: list[str],
-                        cache_path: str = "data/raw/daily_cache_v2.pkl",
+                        cache_path: str = "data/raw/daily_cache_v3.pkl",
                         ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """downloads daily adjusted-close and volume; used for vol1, max_ret, amihud, etc. returns (daily_prices, daily_volume)."""
     import os, pickle
@@ -261,14 +211,12 @@ def _market_regression(stock: np.ndarray, market: np.ndarray):
 def compute_characteristics(returns: pd.DataFrame,
                              mkt_ret: pd.Series,
                              rf: pd.Series,
-                             prices: pd.DataFrame = None,
-                             shares: pd.DataFrame = None,
                              daily_prices: pd.DataFrame = None,
                              daily_volume: pd.DataFrame = None,
                              ) -> np.ndarray:
-    """Compute 21 lagged characteristics from RAW returns, ranked to [-1, 1].
+    """Compute 19 lagged characteristics from RAW returns, ranked to [-1, 1].
     Risk-free returns are subtracted here only for market regressions.
-    Returns an (N, T, 21) array.
+    Returns an (N, T, 19) array.
     """
     T, N = returns.shape
     dates   = returns.index
@@ -281,20 +229,7 @@ def compute_characteristics(returns: pd.DataFrame,
     mkt    = np.asarray(mkt_ret).flatten()  # (T,)
     rf_arr = np.asarray(rf).flatten()       # (T,)
 
-    chars_raw = np.full((T, N, 21), np.nan)
-
-    # [6] mktcap: log(price * shares), both lagged one month
-    if prices is not None and shares is not None:
-        prices_aligned = prices.reindex(returns.index).reindex(
-            columns=returns.columns)
-        shares_aligned = shares.reindex(returns.index).reindex(
-            columns=returns.columns)
-        prices_lagged = prices_aligned.shift(1)
-        shares_lagged = shares_aligned.shift(1)
-        mktcap_raw = prices_lagged.values * shares_lagged.values
-        with np.errstate(divide="ignore", invalid="ignore"):
-            log_mktcap = np.where(mktcap_raw > 1, np.log(mktcap_raw), np.nan)
-        chars_raw[:, :, 6] = log_mktcap
+    chars_raw = np.full((T, N, len(CHAR_NAMES)), np.nan)
 
     # pre-process daily data into arrays for fast monthly indexing
     have_daily = daily_prices is not None and daily_volume is not None
@@ -314,15 +249,9 @@ def compute_characteristics(returns: pd.DataFrame,
                           - 1)
 
         monthly_dates_arr = dates.values             # (T,) datetime64
-        if shares is not None:
-            shares_arr = (shares
-                          .reindex(index=returns.index, columns=tickers)
-                          .values)                   # (T, N)
-        else:
-            shares_arr = None
     else:
         daily_idx_arr = dp_arr = dv_arr = dr_arr = None
-        monthly_dates_arr = shares_arr = None
+        monthly_dates_arr = None
 
     # excess returns used for beta/ivol calculations
     exc_ret = ret - rf_arr[:, None]   # (T, N)
@@ -352,29 +281,29 @@ def compute_characteristics(returns: pd.DataFrame,
         mw12 = mkt_exc[t - 12 : t]
         chars_raw[t, :, 4], chars_raw[t, :, 5] = _market_regression(ew12, mw12)
 
-        # [7] mom3: cumulative return [t-4, t-2]
-        chars_raw[t, :, 7] = _compound_window(ret[t - 4 : t - 1, :])
+        # [6] mom3: cumulative return [t-4, t-2]
+        chars_raw[t, :, 6] = _compound_window(ret[t - 4 : t - 1, :])
 
-        # [8] mom9: cumulative return [t-10, t-2]
+        # [7] mom9: cumulative return [t-10, t-2]
         if t >= 10:
-            chars_raw[t, :, 8] = (
+            chars_raw[t, :, 7] = (
                 _compound_window(ret[t - 10 : t - 1, :]))
 
-        # [9] mom36: cumulative return [t-37, t-13] (24-month window, t≥37)
+        # [8] mom24_13: half-open [t-37, t-13), 24 months with a 13-month gap
         if t >= 37:
-            chars_raw[t, :, 9] = (
+            chars_raw[t, :, 8] = (
                 _compound_window(ret[t - 37 : t - 13, :]))
 
-        # [11] vol6
-        chars_raw[t, :, 11] = np.nanstd(ret[t - 6 : t, :], axis=0, ddof=1)
+        # [10] vol6
+        chars_raw[t, :, 10] = np.nanstd(ret[t - 6 : t, :], axis=0, ddof=1)
 
-        # [12] beta36: OLS market beta over 36 months (t≥36)
+        # [11] beta36: OLS market beta over 36 months (t≥36)
         if t >= 36:
             ew36 = exc_ret[t - 36 : t, :]
             mw36 = mkt_exc[t - 36 : t]
-            chars_raw[t, :, 12], _ = _market_regression(ew36, mw36)
+            chars_raw[t, :, 11], _ = _market_regression(ew36, mw36)
 
-        # [13] beta_down: downside beta, 60-month window, ≥12 negative mkt months
+        # [12] beta_down: downside beta, 60-month window, ≥12 negative mkt months
         if t >= 60:
             ew60  = exc_ret[t - 60 : t, :]
             mw60  = mkt_exc[t - 60 : t]
@@ -384,7 +313,7 @@ def compute_characteristics(returns: pd.DataFrame,
                 ew_d = ew60[dmask, :]
                 beta_d, _ = _market_regression(ew_d, mw_d)
                 beta_d[np.isfinite(ew_d).sum(axis=0) < 12] = np.nan
-                chars_raw[t, :, 13] = beta_d
+                chars_raw[t, :, 12] = beta_d
 
         # daily characteristics (skipped if daily data not provided)
         if not have_daily:
@@ -401,34 +330,34 @@ def compute_characteristics(returns: pd.DataFrame,
         dr_21 = dr_arr[t21s : t1 + 1, :]   # (≤21, N)
         dv_21 = dv_arr[t21s : t1 + 1, :]   # (≤21, N)
 
-        # [10] vol1: daily volatility scaled to a 21-trading-day month
-        chars_raw[t, :, 10] = np.nanstd(dr_21, axis=0, ddof=1) * np.sqrt(21)
+        # [9] vol1: daily volatility scaled to a 21-trading-day month
+        chars_raw[t, :, 9] = np.nanstd(dr_21, axis=0, ddof=1) * np.sqrt(21)
 
-        # [14] max_ret / [15] min_ret over 21-day window
+        # [13] max_ret / [14] min_ret over 21-day window
         with np.errstate(all="ignore"):
-            chars_raw[t, :, 14] = np.nanmax(dr_21, axis=0)
-            chars_raw[t, :, 15] = np.nanmin(dr_21, axis=0)
+            chars_raw[t, :, 13] = np.nanmax(dr_21, axis=0)
+            chars_raw[t, :, 14] = np.nanmin(dr_21, axis=0)
 
-        # [16] high52: price / 52-week high (252 trading days including t1)
+        # [15] high52: price / 52-week high (252 trading days including t1)
         if t1 >= 252:
             high_52w = np.nanmax(dp_arr[t1 - 251 : t1 + 1, :], axis=0)
             with np.errstate(divide="ignore", invalid="ignore"):
-                chars_raw[t, :, 16] = np.where(
+                chars_raw[t, :, 15] = np.where(
                     high_52w > 0, dp_arr[t1, :] / high_52w, np.nan)
 
-        # [17] skew1: 21-day skewness (unbiased, ≥5 obs)
+        # [16] skew1: 21-day skewness (unbiased, ≥5 obs)
         n21 = np.sum(~np.isnan(dr_21), axis=0)
         sk1 = _skew(dr_21, axis=0, bias=False, nan_policy="omit")
-        chars_raw[t, :, 17] = np.where(n21 >= 5, sk1, np.nan)
+        chars_raw[t, :, 16] = np.where(n21 >= 5, sk1, np.nan)
 
-        # [18] skew3: 63-day skewness (unbiased, ≥15 obs)
+        # [17] skew3: 63-day skewness (unbiased, ≥15 obs)
         t63s  = max(0, t1 - 62)
         dr_63 = dr_arr[t63s : t1 + 1, :]
         n63   = np.sum(~np.isnan(dr_63), axis=0)
         sk3   = _skew(dr_63, axis=0, bias=False, nan_policy="omit")
-        chars_raw[t, :, 18] = np.where(n63 >= 15, sk3, np.nan)
+        chars_raw[t, :, 17] = np.where(n63 >= 15, sk3, np.nan)
 
-        # [19] amihud: mean |r| / (px × vol) × 1e6, 252-day window, ≥60 valid
+        # [18] amihud: mean |r| / (px × vol) × 1e6, 252-day window, ≥60 valid
         if t1 >= 252:
             dr_252 = dr_arr[t1 - 251 : t1 + 1, :]
             dp_252 = dp_arr[t1 - 251 : t1 + 1, :]
@@ -438,16 +367,8 @@ def compute_characteristics(returns: pd.DataFrame,
                 ratio  = np.where(dolvol > 0,
                                   np.abs(dr_252) / dolvol, np.nan)
             n_valid = np.sum(~np.isnan(ratio), axis=0)
-            chars_raw[t, :, 19] = np.where(
+            chars_raw[t, :, 18] = np.where(
                 n_valid >= 60, np.nanmean(ratio, axis=0) * 1e6, np.nan)
-
-        # [20] turn1: mean daily turnover (vol / shares) over 21-day window
-        if shares_arr is not None:
-            sh_tm1 = shares_arr[t - 1, :]   # (N,)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                daily_turn = np.where(
-                    sh_tm1[None, :] > 0, dv_21 / sh_tm1[None, :], np.nan)
-            chars_raw[t, :, 20] = np.nanmean(daily_turn, axis=0)
 
     # cross-sectional rank normalization to [-1, 1] each month
     P_total    = chars_raw.shape[2]
@@ -497,81 +418,66 @@ def time_split(returns: pd.DataFrame,
     return splits
 
 
-def load_data(cache_path: str = "data/raw/data_cache_v2.pkl",
-              allow_legacy_cache: bool = False) -> dict:
-    """runs the full data pipeline (tickers → returns → chars → splits) and caches the result. returns dict with keys 'splits', 'returns', 'chars', 'dates', 'tickers'."""
+def load_data(cache_path: str = "data/raw/data_cache_v4.pkl") -> dict:
+    """Build a 19-feature panel with common model eligibility and train-only filters."""
     import os, pickle
+    from datetime import datetime, timezone
 
     if os.path.exists(cache_path):
         print(f"Loading cached data from {cache_path} …")
         with open(cache_path, "rb") as f:
             cached = pickle.load(f)
-        cached_p = cached.get("chars", np.array([])).shape
-        if len(cached_p) == 3 and cached_p[2] == len(CHAR_NAMES):
-            if cached.get("cache_version") != CACHE_VERSION:
-                if not allow_legacy_cache:
-                    raise ValueError("Legacy data cache uses the old characteristic pipeline. "
-                                     "Choose a new --cache path to rebuild, or explicitly use "
-                                     "--allow-legacy-cache for historical diagnostics.")
-                warnings.warn("Using legacy characteristics; results are not a corrected replication.")
-            print(f"  Cache valid: P={cached_p[2]}, "
-                  f"T={cached_p[1]}, N={cached_p[0]}.")
-            return cached
-        else:
-            actual_p = cached_p[2] if len(cached_p) == 3 else "unknown"
-            print(f"  WARNING: cached data has P={actual_p}, expected P=21. "
-                  f"Rebuilding cache …")
+        if (cached.get("cache_version") != CACHE_VERSION
+                or cached.get("characteristic_names") != CHAR_NAMES):
+            raise ValueError("Stale data cache. Use a new --cache path to rebuild the current feature panel.")
+        return cached
 
     tickers = get_sp500_tickers()
     raw_prices, raw_returns = download_monthly_returns(tickers)
     mkt_ret, rf = download_market_and_rf()
-
-    # Align all series to common date range and stock universe
-    common_dates = (raw_returns.index
-                    .intersection(rf.index)
-                    .intersection(mkt_ret.index))
-    raw_prices  = raw_prices.loc[common_dates]
+    common_dates = raw_returns.index.intersection(rf.index).intersection(mkt_ret.index)
     raw_returns = raw_returns.loc[common_dates]
-    mkt_ret     = mkt_ret.loc[common_dates]
-    rf          = rf.loc[common_dates]
-
-    # Excess returns: subtract monthly risk-free rate from each stock
+    mkt_ret, rf = mkt_ret.loc[common_dates], rf.loc[common_dates]
     excess_returns = raw_returns.subtract(rf, axis=0)
 
-    print("Downloading shares outstanding …")
-    shares = download_shares_outstanding(tickers, os.path.join(os.path.dirname(cache_path), "shares_cache_v2.pkl"))
-    shares = shares.reindex(index=common_dates, columns=raw_returns.columns)
-
-    print("Downloading daily prices and volume …")
-    daily_prices, daily_volume = download_daily_data(tickers, os.path.join(os.path.dirname(cache_path), "daily_cache_v2.pkl"))
-    # Restrict daily data to the stock universe that survived the quality filter
+    daily_prices, daily_volume = download_daily_data(
+        list(raw_returns.columns), os.path.join(os.path.dirname(cache_path), "daily_cache_v3.pkl"))
     daily_prices = daily_prices.reindex(columns=raw_returns.columns)
     daily_volume = daily_volume.reindex(columns=raw_returns.columns)
-
-    print("Computing firm characteristics …")
-    # Characteristic regressions subtract rf internally; pass raw returns once.
+    daily_prices = clean_price_history(daily_prices, daily_volume)
+    print("Computing 19 lagged price/volume characteristics …")
     chars = compute_characteristics(raw_returns, mkt_ret, rf,
-                                    prices=raw_prices, shares=shares,
-                                    daily_prices=daily_prices,
-                                    daily_volume=daily_volume)
-
-    print("Splitting data …")
-    splits = time_split(excess_returns, chars)
-
+                                    daily_prices=daily_prices, daily_volume=daily_volume)
+    eligible = np.isfinite(excess_returns.values) & np.isfinite(chars).all(axis=2).T
+    # Every model uses exactly the same observed training/validation/test panel.
+    masked_returns = excess_returns.where(eligible)
+    keep_stocks = masked_returns.loc[:TRAIN_END].notna().sum(axis=0) >= MIN_MONTHS
+    masked_returns = masked_returns.loc[:, keep_stocks]
+    chars = chars[keep_stocks.values]
+    keep_months = masked_returns.notna().any(axis=1)
+    masked_returns = masked_returns.loc[keep_months]
+    chars = chars[:, keep_months.values, :]
+    if masked_returns.empty:
+        raise ValueError("No eligible observations after the training-coverage filter.")
+    print(f"Common panel: {masked_returns.shape[1]} stocks, {len(masked_returns)} months.")
+    splits = time_split(masked_returns, chars)
     result = {
-        "splits":  splits,
-        "returns": excess_returns,
-        "chars":   chars,
-        "dates":   common_dates,
-        "tickers": list(raw_returns.columns),
-        "cache_version": CACHE_VERSION,
-        "characteristic_names": CHAR_NAMES,
+        "splits": splits, "returns": masked_returns, "chars": chars,
+        "dates": masked_returns.index, "tickers": list(masked_returns.columns),
+        "cache_version": CACHE_VERSION, "characteristic_names": CHAR_NAMES,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "universe_snapshot": tickers,
+        "source_dates": {"start": START_DATE, "end": END_DATE},
+        "training_min_observations": MIN_MONTHS,
+        "price_history_starts": PRICE_HISTORY_STARTS,
+        "price_quality_rules": ["Exclude quotes with nonpositive volume before resampling/filling",
+                                "NVR price history starts after the 1993 reorganization"],
+        "coverage": {name: {"months": len(part["returns"]),
+                            "observed_pairs": int(part["returns"].notna().sum().sum())}
+                     for name, part in splits.items()},
     }
-
     os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
     with open(cache_path, "wb") as f:
-        import pickle as pk
-        pk.dump(result, f)
+        pickle.dump(result, f)
     print(f"Data cached to {cache_path}.")
-
     return result

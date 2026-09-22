@@ -6,6 +6,7 @@ from datetime import datetime
 import hashlib
 import importlib.metadata
 import json
+import platform
 from pathlib import Path
 import random
 import subprocess
@@ -44,9 +45,7 @@ def set_seeds(seed):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="PCA, IPCA, AE, and residual conditional autoencoders")
     parser.add_argument("--device", choices=["cpu", "cuda", "mps"], default="cpu")
-    parser.add_argument("--cache", default="data/raw/data_cache_v2.pkl")
-    parser.add_argument("--allow-legacy-cache", action="store_true",
-                        help="Explicitly allow historical characteristics for diagnostics")
+    parser.add_argument("--cache", default="data/raw/data_cache_v4.pkl")
     parser.add_argument("--run-dir", help="New output directory; existing directory required with --skip-train")
     parser.add_argument("--figures-dir", help="Override the default RUN_DIR/plots directory")
     parser.add_argument("--seed", type=int, default=42)
@@ -160,7 +159,7 @@ def main(argv=None):
     checkpoint = run_dir / "models" / "checkpoint.pt"
     if args.skip_train:
         if not checkpoint.is_file():
-            raise SystemExit(f"Checkpoint missing: {checkpoint}. Historical May outputs contain no saved models.")
+            raise SystemExit(f"Checkpoint missing: {checkpoint}.")
     else:
         run_dir.mkdir(parents=True, exist_ok=False)
         (run_dir / "models").mkdir()
@@ -169,7 +168,7 @@ def main(argv=None):
     with (run_dir / log_name).open("w") as log, redirect_stdout(_Tee(sys.stdout, log)), redirect_stderr(_Tee(sys.stderr, log)):
         print(f"Run directory: {run_dir}")
         print("SYNTHETIC SMOKE TEST — not empirical findings" if args.smoke_test else "Empirical data run")
-        data = synthetic_data(args.seed) if args.smoke_test else load_data(args.cache, args.allow_legacy_cache)
+        data = synthetic_data(args.seed) if args.smoke_test else load_data(args.cache)
         fingerprint = data_fingerprint(data)
         splits = data["splits"]
         if args.skip_train:
@@ -191,6 +190,8 @@ def main(argv=None):
                       "seeds": seeds if args.multi_seed else [args.seed], "data_fingerprint": fingerprint,
                       "cache_version": data.get("cache_version", "legacy"), "git_revision": revision,
                       "git_dirty": dirty, "python": sys.version,
+                      "source_sha256": {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                                        for p in [Path("main.py"), *sorted(Path("src").glob("*.py"))]},
                       "versions": {name: importlib.metadata.version(name) for name in
                                    ("torch", "numpy", "pandas", "scipy", "scikit-learn", "yfinance")},
                       "splits": {name: {"start": str(s['returns'].index[0].date()),
@@ -198,6 +199,18 @@ def main(argv=None):
                                           "months": len(s['returns']), "stocks": s['returns'].shape[1]}
                                  for name, s in splits.items()}}
             (run_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+            environment = {
+                "python": sys.version, "platform": platform.platform(),
+                "packages": dict(sorted((d.metadata["Name"], d.version)
+                                        for d in importlib.metadata.distributions())),
+            }
+            (run_dir / "environment.json").write_text(json.dumps(environment, indent=2) + "\n")
+            manifest = {key: data[key] for key in (
+                "cache_version", "characteristic_names", "retrieved_at", "universe_snapshot",
+                "source_dates", "training_min_observations", "coverage", "tickers",
+                "price_history_starts", "price_quality_rules") if key in data}
+            manifest["data_fingerprint"] = fingerprint
+            (run_dir / "data_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
             models = train.train_all_models(splits, k_list=train.K_GRID, device=args.device,
                                              multi_seed=args.multi_seed, seeds=seeds, run_dir=str(run_dir))
             torch.save({"models": models, "data_fingerprint": fingerprint}, checkpoint)
@@ -222,8 +235,6 @@ def main(argv=None):
         story = format_paper_story(summary, significance)
         if data.get("synthetic"):
             story = "SYNTHETIC SMOKE TEST — not empirical findings\n\n" + story
-        elif data.get("cache_version") == "legacy" or "cache_version" not in data:
-            story = "LEGACY DATA DIAGNOSTIC — not a corrected replication\n\n" + story
         print("\n" + story)
         (run_dir / "results_summary.txt").write_text(story + "\n")
 

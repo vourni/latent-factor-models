@@ -246,6 +246,14 @@ def train_cae_single(splits: dict,
     if len(t_train) == 0 or len(t_val) == 0:
         raise ValueError("CAE training and validation each need characteristic-complete observations.")
 
+    # Inputs do not change between epochs. Cache tensors only while this model
+    # trains, then release them so a full multi-seed grid stays memory bounded.
+    model._training_batches = {
+        (id(train_ret), id(train_chars)): model._build_batch(train_ret, train_chars, np.arange(T_train)),
+        (id(val_ret), id(val_chars)): model._build_batch(val_ret, val_chars, np.arange(T_val)),
+    }
+    managed_all = model._build_batch(train_ret, train_chars, t_train)[0]
+
     best_val_loss  = float("inf")
     best_state     = None
     patience_count = 0
@@ -259,7 +267,6 @@ def train_cae_single(splits: dict,
         # full-sample orth penalty on all training managed portfolios
         model.net.train()
         optimizer.zero_grad()
-        managed_all, _, _, _ = model._build_batch(train_ret, train_chars, t_train)
         all_factors = model.net.encoder(managed_all)
         orth_loss = LAMBDA_ORTH * orthonormality_penalty(all_factors)
         orth_loss.backward()
@@ -293,6 +300,7 @@ def train_cae_single(splits: dict,
     model.net.load_state_dict(best_state)
     model.train_losses = train_losses
     model.val_losses = val_losses
+    del model._training_batches
 
     # diagnostic: near-zero mean factor signals the model will predict ~0 for all stocks
     if not use_linear:

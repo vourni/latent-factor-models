@@ -1,0 +1,84 @@
+{
+  "device": "cpu",
+  "cache": "data/raw/data_cache_v4.pkl",
+  "run_dir": "results/full-2026-09-22-clean",
+  "figures_dir": null,
+  "seed": 42,
+  "multi_seed": true,
+  "seeds": [
+    10,
+    30,
+    45,
+    99,
+    2048
+  ],
+  "k": [
+    2,
+    3,
+    5,
+    8,
+    10
+  ],
+  "lambda_lin": [
+    0.001,
+    0.005,
+    0.01,
+    0.05,
+    0.1
+  ],
+  "lambda_nonlin": [
+    1e-06,
+    1e-05,
+    5e-05,
+    0.0001,
+    0.0005
+  ],
+  "max_epochs": 400,
+  "patience": 25,
+  "bootstrap_samples": 1000,
+  "threads": 1,
+  "skip_train": false,
+  "smoke_test": false,
+  "data_fingerprint": "30a18111c6e5bdc252880a17cc7de12d18edbd287ce0b20f800fa51225b189cf",
+  "cache_version": 4,
+  "git_revision": "65ab032518db10f1304f6aeab6488e3f8a39bc3a",
+  "git_dirty": true,
+  "python": "3.14.3 (main, Feb  3 2026, 15:32:20) [Clang 17.0.0 (clang-1700.6.3.2)]",
+  "source_sha256": {
+    "main.py": "5a90e88205672fe145ca99a718cbc54e05df6da132f0365573a72a77871a9e3c",
+    "src/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/data.py": "7456c2b6a48a8458b2abffbb06484d436e5af971c44213672a87812373503a2e",
+    "src/ensemble.py": "711720ee1a5cca7e866c08ddaf4f4ee3cefda1e7b5e79539437400a2a251624d",
+    "src/evaluate.py": "55b2f2c8a2e7b76cdb8df2423fa0d655cf2a19696aa5b780f418bcad6d9f39fa",
+    "src/models.py": "4a3365466b03a9754bf358d7318a7299579e0374f4360562af4fd21bb829bbad",
+    "src/train.py": "8ea4165d451e6226d709e5c860948f6af6a27c318b596f22f189a0ea5b83ef5a"
+  },
+  "versions": {
+    "torch": "2.11.0",
+    "numpy": "2.4.4",
+    "pandas": "3.0.3",
+    "scipy": "1.17.1",
+    "scikit-learn": "1.8.0",
+    "yfinance": "1.3.0"
+  },
+  "splits": {
+    "train": {
+      "start": "1985-02-28",
+      "end": "2009-12-31",
+      "months": 299,
+      "stocks": 365
+    },
+    "val": {
+      "start": "2010-01-31",
+      "end": "2014-12-31",
+      "months": 60,
+      "stocks": 365
+    },
+    "test": {
+      "start": "2015-01-31",
+      "end": "2024-12-31",
+      "months": 120,
+      "stocks": 365
+    }
+  }
+}

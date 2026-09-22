@@ -1,0 +1,21 @@
+RESULTS — 2015-01 to 2024-12 (120 months)
+Representative ResCAE chosen on validation data: (8, 0.1, 5e-05)
+              Model  K   Pred_R2    Sharpe      NL_frac  drift_rel
+                PCA  8  0.015162  0.608101          NaN        NaN
+               IPCA  8 -0.000399  0.829139          NaN        NaN
+                 AE  8 -0.003303 -0.264582          NaN        NaN
+       ResCAE-Fixed  8  0.009011  0.764343 1.157099e-01   0.000000
+             ResCAE  8  0.017304  0.710268 1.000616e-07   0.840641
+CAE-NL (robustness)  8  0.014282       NaN          NaN        NaN
+
+DM tests: positive statistic favors the first named model; two-sided p-values.
+  ResCAE vs IPCA: DM=1.384, p=0.1663, Holm p across K=0.8317
+  ResCAE vs PCA: DM=0.672, p=0.5013, Holm p across K=1.0000
+  ResCAE-Fixed vs IPCA: DM=0.513, p=0.6080, Holm p across K=1.0000
+  ResCAE vs ResCAE-Fixed: DM=1.448, p=0.1475, Holm p across K=0.7376
+
+Predictive R² and portfolio Sharpe measure different objectives.
+ResCAE-Fixed freezes W_skip; its encoder and nonlinear branch both train.
+The comparison does not isolate nonlinearity with fixed factors.
+φ is a branch variance ratio excluding covariance; it is not explained return variance.
+Flat predictions provide no stock ranking; this does not validate an architecture.

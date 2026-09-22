@@ -1,7 +1,7 @@
 """
-evaluation metrics for the ResCAE study. tests whether the nonlinear residual g(z)
-adds predictability beyond IPCA across six metrics: total R², predictive R², factor
-Sharpe, nonlinear contribution φ, IPCA drift, and OOS pricing error (CSPE).
+Evaluation of six factor-model families: reconstruction and forecast R², portfolio
+Sharpe, branch loading variance φ, IPCA weight drift, and pricing error (CSPE).
+Architecture comparisons and branch diagnostics do not uniquely identify nonlinearity.
 """
 
 import numpy as np
@@ -1524,7 +1524,7 @@ def print_stability_summary(stability_df):
     if stability_df.empty:
         return "No multi-seed stability results available."
     if "selected_by_validation" not in stability_df:
-        return "Legacy stability file has no validation selection markers; see the historical audit."
+        return "Seed diagnostics lack validation selection markers; regenerate them from the checkpoint."
     selected = stability_df[stability_df["selected_by_validation"]]
     table = selected.groupby(["Model", "K"])[["pred_r2", "sharpe", "phi", "drift"]].agg(["mean", "std"])
     return "Seed stability at validation-selected configurations (test metrics):\n" + table.to_string()

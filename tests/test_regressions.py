@@ -13,7 +13,8 @@ import pandas as pd
 import torch
 
 from main import parse_args, synthetic_data, data_fingerprint
-from src.data import _compound_window, _market_regression, load_data, time_split
+from src.data import (_compound_window, _market_regression, load_data,
+                      compute_characteristics, CHAR_NAMES, CACHE_VERSION, clean_price_history)
 from src.models import PCAModel, IPCAModel, CAEModel
 from src.evaluate import (factor_sharpe, get_portfolio_returns, nonlinear_contribution,
                           diebold_mariano_test, build_summary_table, _best_key_per_k,
@@ -38,6 +39,17 @@ class RegressionTests(unittest.TestCase):
         self.assertAlmostEqual(values[0], 0.32)
         self.assertTrue(np.isnan(values[1]))
 
+    def test_prices_exclude_security_break_and_nontrading_placeholders(self):
+        dates = pd.to_datetime(['1993-09-30', '1993-10-01', '1993-10-04'])
+        prices = pd.DataFrame({'NVR': [0.375, 10.25, 10.0], 'OTHER': [1., 10., 11.]}, index=dates)
+        volume = pd.DataFrame({'NVR': [100., 100., 100.], 'OTHER': [0., 100., 100.]}, index=dates)
+        clean = clean_price_history(prices, volume)
+        returns = clean.pct_change(fill_method=None)
+        self.assertTrue(returns.iloc[:2].isna().all().all())
+        self.assertAlmostEqual(returns.loc['1993-10-04', 'NVR'], 10.0 / 10.25 - 1)
+        self.assertAlmostEqual(returns.loc['1993-10-04', 'OTHER'], .1)
+        self.assertEqual(prices.iloc[0, 0], .375)
+
     def test_ols_uses_paired_observations(self):
         market = np.linspace(-0.1, 0.1, 12)
         stocks = np.column_stack([0.01 + 2 * market, -0.02 - 3 * market])
@@ -45,6 +57,32 @@ class RegressionTests(unittest.TestCase):
         beta, ivol = _market_regression(stocks, market)
         np.testing.assert_allclose(beta, [2, -3], atol=1e-12)
         np.testing.assert_allclose(ivol, 0, atol=1e-12)
+
+    def test_nineteen_features_use_only_prior_month_information(self):
+        rng = np.random.default_rng(33)
+        dates = pd.date_range('1980-01-31', periods=90, freq='ME')
+        columns = list('ABCDEFGH')
+        returns = pd.DataFrame(rng.normal(0, 0.06, (90, 8)), index=dates, columns=columns)
+        market = pd.Series(np.where(np.arange(90) % 2, -0.03, 0.04), index=dates)
+        rf = pd.Series(0.001, index=dates)
+        days = pd.bdate_range('1980-01-01', dates[-1])
+        prices = pd.DataFrame(100 * np.exp(np.cumsum(rng.normal(0, 0.01, (len(days), 8)), axis=0)),
+                              index=days, columns=columns)
+        volume = pd.DataFrame(rng.uniform(1e5, 1e6, prices.shape), index=days, columns=columns)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            original = compute_characteristics(returns, market, rf, prices, volume)
+            changed_returns = returns.copy()
+            changed_returns.iloc[80:] *= 10
+            changed_prices, changed_volume = prices.copy(), volume.copy()
+            changed_prices.loc[changed_prices.index > dates[79]] *= 2
+            changed_volume.loc[changed_volume.index > dates[79]] *= 4
+            changed = compute_characteristics(changed_returns, market, rf, changed_prices, changed_volume)
+        self.assertEqual(original.shape, (8, 90, 19))
+        self.assertNotIn('log_mktcap', CHAR_NAMES)
+        self.assertNotIn('turn1', CHAR_NAMES)
+        self.assertTrue(np.isfinite(original[:, 70, :]).all())
+        np.testing.assert_array_equal(original[:, :81], changed[:, :81])
 
     def test_data_pipeline_passes_raw_returns_once(self):
         raw = self.data['returns']
@@ -54,19 +92,19 @@ class RegressionTests(unittest.TestCase):
              patch('src.data.get_sp500_tickers', return_value=list(raw.columns)), \
              patch('src.data.download_monthly_returns', return_value=(raw.abs() + 100, raw)), \
              patch('src.data.download_market_and_rf', return_value=(market, rf)), \
-             patch('src.data.download_shares_outstanding', return_value=raw * 0 + 1000), \
              patch('src.data.download_daily_data', return_value=(raw, raw)), \
-             patch('src.data.compute_characteristics', return_value=self.data['chars']) as compute:
+             patch('src.data.compute_characteristics', return_value=self.data['chars']) as compute, \
+             patch('src.data.MIN_MONTHS', 10):
             data = load_data(str(Path(tmp) / 'cache.pkl'))
         pd.testing.assert_frame_equal(compute.call_args.args[0], raw)
         np.testing.assert_allclose(data['returns'], raw - 0.001)
-        self.assertEqual(data['cache_version'], 2)
+        self.assertEqual(data['cache_version'], CACHE_VERSION)
 
-    def test_legacy_cache_requires_opt_in(self):
+    def test_stale_cache_requires_rebuild(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'legacy.pkl'
             path.write_bytes(pickle.dumps({'chars': np.zeros((2, 2, 21))}))
-            with self.assertRaisesRegex(ValueError, 'Legacy data cache'):
+            with self.assertRaisesRegex(ValueError, 'Stale data cache'):
                 load_data(str(path))
 
     def test_pca_imputation_uses_training_means(self):
@@ -211,6 +249,7 @@ class RegressionTests(unittest.TestCase):
                 fitted = next(iter(models[family].values()))
                 self.assertEqual([m.seed for m in fitted], [5, 6])
                 self.assertTrue(all(str(m.device) == 'cpu' for m in fitted))
+                self.assertTrue(all(not hasattr(m, '_training_batches') for m in fitted))
             for model in next(iter(models['cae_fixed'].values())):
                 self.assertEqual(model.compute_ipca_drift(), 0.)
                 self.assertFalse(model.net.decoder.W_skip.weight.requires_grad)

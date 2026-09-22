@@ -1,0 +1,7 @@
+{
+  "forecast": 0.011649234220385551,
+  "Pred_R2": 0.01671057939529419,
+  "CSPE": 0.0067341508859332854,
+  "Sharpe": null,
+  "estimation": "Pooled mean of observed training returns; no tuning"
+}

@@ -1,0 +1,13 @@
+{
+  "status": "passed",
+  "selected_rows": 30,
+  "all_config_rows": 190,
+  "seed_rows": 875,
+  "neural_fits": 880,
+  "data_fingerprint": "30a18111c6e5bdc252880a17cc7de12d18edbd287ce0b20f800fa51225b189cf",
+  "checkpoint_metrics_recomputed": true,
+  "validation_selection_verified": true,
+  "fixed_weight_drift_zero": true,
+  "common_panel_verified": true,
+  "security_boundary_verified": true
+}
