@@ -1,7 +1,6 @@
 """
-three latent factor models for asset pricing: PCA (linear baseline), a plain
-autoencoder (nonlinear, cross-sectional), and CAE (conditional autoencoder with
-residual decoder). all models expose .fit(), .get_factors(), and .reconstruct().
+Latent factor models: PCA, IPCA, a plain autoencoder, and conditional
+autoencoders. All models expose fit(), predict(), and reconstruct().
 """
 
 import numpy as np
@@ -16,8 +15,16 @@ def _to_tensor(x: np.ndarray, device: torch.device) -> torch.Tensor:
     return torch.tensor(x, dtype=torch.float32, device=device)
 
 
+def _column_means(returns: np.ndarray) -> np.ndarray:
+    """Finite training column means, with zero for stocks without observations."""
+    valid = np.isfinite(returns)
+    counts = valid.sum(axis=0)
+    return np.divide(np.where(valid, returns, 0).sum(axis=0), counts,
+                     out=np.zeros(returns.shape[1]), where=counts > 0)
+
+
 def orthonormality_penalty(factors: torch.Tensor) -> torch.Tensor:
-    """penalise deviation of F'F/T from identity. resolves rotational indeterminacy.
+    """penalise deviation of F'F/T from identity; orthogonal rotations remain unidentified.
     params: {factors: (T, K) tensor}. returns scalar tensor."""
     T = factors.shape[0]
     gram     = (factors.T @ factors) / T                           # (K, K)
@@ -35,8 +42,8 @@ class PCAModel:
     def fit(self, returns: np.ndarray, **kwargs) -> "PCAModel":
         """fits PCA on training returns. params: {returns: (T, N) ndarray with NaN for missing}. returns PCAModel."""
         # NaNs filled with column means; all-NaN columns fall back to 0.0
-        col_means = np.nanmean(returns, axis=0)
-        col_means = np.where(np.isnan(col_means), 0.0, col_means)
+        col_means = _column_means(returns)
+        self.fill_values_ = col_means
         filled = np.where(np.isnan(returns), col_means[None, :], returns)
 
         self._pca = SklearnPCA(n_components=self.n_factors, random_state=42)
@@ -45,9 +52,7 @@ class PCAModel:
 
     def get_factors(self, returns: np.ndarray, **kwargs) -> np.ndarray:
         """projects returns onto fitted principal components. returns (T, K) ndarray."""
-        col_means = np.nanmean(returns, axis=0)
-        col_means = np.where(np.isnan(col_means), 0.0, col_means)
-        filled = np.where(np.isnan(returns), col_means[None, :], returns)
+        filled = np.where(np.isnan(returns), self.fill_values_[None, :], returns)
         return self._pca.transform(filled)   # (T, K)
 
     def reconstruct(self, returns: np.ndarray, **kwargs) -> np.ndarray:
@@ -60,8 +65,7 @@ class PCAModel:
         """OOS-safe forecast: loadings × mean training factor. uses raw (uncentered)
         projections because sklearn PCA centers data, making get_factors().mean() always 0.
         returns (T, N) ndarray broadcast constant across all months."""
-        col_means = np.nanmean(train_returns, axis=0)
-        col_means = np.where(np.isnan(col_means), 0.0, col_means)
+        col_means = _column_means(train_returns)
         train_filled = np.where(np.isnan(train_returns), col_means[None, :], train_returns)
 
         components = self._pca.components_                  # (K, N)
@@ -154,9 +158,22 @@ class IPCAModel:
                 break
 
         self.gamma          = Gamma
-        self.factors_train_ = factors.copy()       # (T, K)
-        self.factor_mean_   = factors.mean(axis=0) # (K,)
+        # The final ALS update changes Gamma: factors must be solved again
+        # against that final loading matrix. Months without data are missing.
+        self.factors_train_ = self.get_factors(returns, chars)
+        self.factor_mean_ = np.nanmean(self.factors_train_, axis=0)
         return self
+
+    def get_factors(self, returns: np.ndarray, chars: np.ndarray) -> np.ndarray:
+        """OLS factors for the fitted loadings; unavailable months remain NaN."""
+        factors = np.full((len(returns), self.n_factors), np.nan)
+        for t, r_t in enumerate(returns):
+            z_t = chars[:, t, :]
+            valid = np.isfinite(r_t) & np.isfinite(z_t).all(axis=1)
+            if valid.sum() >= self.n_factors:
+                factors[t] = np.linalg.lstsq(
+                    z_t[valid] @ self.gamma.T, r_t[valid], rcond=None)[0]
+        return factors
 
     def predict(self,
                 returns: np.ndarray,
@@ -318,7 +335,8 @@ class _CAEEncoder(nn.Module):
 class _CAEDecoder(nn.Module):
     """maps stock characteristics to beta loadings via residual connection:
     β_{i,t} = W_skip·z_{i,t} + g(z_{i,t}). W_skip warm-started from IPCA so
-    g learns only the residual. weights are shared across stocks.
+    g supplies a flexible correction. Both branches can learn linear effects;
+    warm-starting does not identify a unique decomposition. Weights are shared across stocks.
     params: {n_chars: int, n_factors: int, use_linear: bool}."""
 
     def __init__(self, n_chars: int, n_factors: int, use_linear: bool = True):
@@ -385,7 +403,7 @@ class CAEModel:
     use_linear: bool, freeze_linear: bool, device: str}."""
 
     def __init__(self,
-                 n_chars: int = 7,
+                 n_chars: int = 21,
                  n_factors: int = 5,
                  lam_lin: float = 0.0,
                  lam_nonlin: float = 0.0,
@@ -428,15 +446,17 @@ class CAEModel:
 
     def initialize_from_ipca(self,
                               returns: np.ndarray,
-                              chars: np.ndarray) -> None:
+                              chars: np.ndarray,
+                              ipca: Optional[IPCAModel] = None) -> None:
         """warm-starts W_skip from an IPCA fit; reinitialises g with std=0.01 so
         the nonlinear correction starts negligible. params: {returns: (T, N), chars: (N, T, P)}."""
         assert self.net is not None, "Call fit() before initialize_from_ipca()."
         if not self.use_linear:
             return  # NL-only variant has no W_skip to warm-start
-        print(f"    Fitting IPCA for warm-start (K={self.n_factors}) …")
-        ipca = IPCAModel(n_factors=self.n_factors)
-        ipca.fit(returns, chars)
+        if ipca is None:
+            print(f"    Fitting IPCA for warm-start (K={self.n_factors}) …")
+            ipca = IPCAModel(n_factors=self.n_factors)
+            ipca.fit(returns, chars)
         ipca_gamma = ipca.gamma   # (K, P)
 
         gamma_tensor = torch.tensor(ipca_gamma, dtype=torch.float32,
@@ -453,7 +473,7 @@ class CAEModel:
                 nn.init.normal_(module.weight, std=0.01)
                 nn.init.zeros_(module.bias)
 
-        self.gamma_init = ipca_gamma.copy()
+        self.gamma_init = gamma_tensor.cpu().numpy().copy()
         norm = np.linalg.norm(ipca_gamma, "fro")
         print(f"    IPCA init done: ‖Γ‖_F = {norm:.4f}")
 
@@ -468,8 +488,6 @@ class CAEModel:
         ResCAE-Fixed (frozen by construction), None if no linear branch or no warm-start."""
         if not self.use_linear:
             return None
-        if self.freeze_linear:
-            return 0.0
         if not hasattr(self, "gamma_init") or self.gamma_init is None:
             return None
         W     = self.net.decoder.W_skip.weight.detach().cpu().numpy()
@@ -523,7 +541,7 @@ class CAEModel:
             r_t = returns[t, :]      # (N,)  — NaN where missing
             z_t = chars[:, t, :]     # (N, P) — NaN where missing
 
-            valid = ~np.isnan(r_t) & ~np.any(np.isnan(z_t), axis=1)
+            valid = np.isfinite(r_t) & np.isfinite(z_t).all(axis=1)
             mask_np[b, valid] = 1.0
 
             r_clean = np.nan_to_num(r_t, nan=0.0)
@@ -558,7 +576,9 @@ class CAEModel:
         self.net.eval()
         with torch.no_grad():
             factors = self.net.encoder(managed)
-        return factors.cpu().numpy()
+        result = factors.cpu().numpy()
+        result[mask.sum(dim=1).cpu().numpy() == 0] = np.nan
+        return result
 
     def reconstruct(self,
                     returns: np.ndarray,
@@ -587,22 +607,16 @@ class CAEModel:
                 train_chars: np.ndarray) -> np.ndarray:
         """OOS-safe forecast: r̂_{i,t} = β_{i,t}' f̄_train. mean training factor
         substitutes for unobservable current-period factor.
-        returns (T_test, N) ndarray with NaN where input was NaN."""
+        returns (T_test, N) ndarray with NaN only where characteristics are unavailable."""
         assert self.net is not None
-        mean_factor_np = self.get_factors(train_returns, train_chars).mean(axis=0)
-
-        # near-zero f̄_train is the primary cause of flat predictions
-        f_bar_norm = float(np.linalg.norm(mean_factor_np))
-        print(f"  [{self.model_name} K={self.n_factors}] "
-              f"‖f̄_train‖ = {f_bar_norm:.4f}  "
-              f"(< 1e-3 → predictions will be near-zero for all stocks)")
+        mean_factor_np = np.nanmean(self.get_factors(train_returns, train_chars), axis=0)
 
         mean_factor = _to_tensor(mean_factor_np, self.device)  # (K,)
 
         T, N = returns.shape
-        t_indices = np.arange(T)
-        # only z_stocks needed here; other outputs unused
-        _, z_stocks, _, _ = self._build_batch(returns, chars, t_indices)
+        # Forecasts depend only on lagged characteristics and training data.
+        # Do not read or mask using realized forecast-period returns.
+        z_stocks = _to_tensor(np.nan_to_num(chars.transpose(1, 0, 2), nan=0.0), self.device)
 
         self.net.eval()
         with torch.no_grad():
@@ -614,18 +628,8 @@ class CAEModel:
             r_hat = (beta * mean_factor.unsqueeze(0).unsqueeze(0)).sum(dim=-1)  # (T, N)
 
         r_hat_np = r_hat.cpu().numpy()
-        nan_mask = np.isnan(returns) | np.any(np.isnan(chars.transpose(1, 0, 2)), axis=2)
+        nan_mask = ~np.isfinite(chars.transpose(1, 0, 2)).all(axis=2)
         r_hat_np[nan_mask] = np.nan
-
-        # flag flat predictions — indicates collapsed g(z) or near-zero f̄_train
-        cs_std = float(np.nanstd(r_hat_np))
-        if cs_std < 1e-6:
-            beta_np = beta_flat.cpu().numpy()
-            beta_cs_std = float(np.std(beta_np))
-            print(f"  [{self.model_name} K={self.n_factors}] "
-                  f"WARNING: predictions are flat (cs_std={cs_std:.2e}).  "
-                  f"beta cs_std={beta_cs_std:.4f}, ‖f̄‖={f_bar_norm:.4e}.  "
-                  f"{'g(z) is near-constant' if beta_cs_std < 1e-4 else 'f̄_train is near-zero'}")
 
         return r_hat_np
 
@@ -657,11 +661,11 @@ class CAEModel:
         bl = beta_lin.cpu().numpy().reshape(-1, self.n_factors)[mask_flat]
         bn = beta_nonlin.cpu().numpy().reshape(-1, self.n_factors)[mask_flat]
 
-        var_lin    = float(np.var(bl))
-        var_nonlin = float(np.var(bn))
-
-        # collapsed g(z) makes phi=1.0 meaningless for NL-only; return (0,0) so caller reports N/A
-        if var_nonlin < 1e-10 and not self.use_linear:
-            return 0.0, 0.0
+        if len(bl) == 0:
+            return np.nan, np.nan
+        # Average within-factor variances; different constant factor loadings
+        # must not count as variation across stock-month observations.
+        var_lin    = float(np.var(bl, axis=0).mean())
+        var_nonlin = float(np.var(bn, axis=0).mean())
 
         return var_lin, var_nonlin

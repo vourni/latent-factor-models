@@ -9,10 +9,15 @@ import yfinance as yf
 from scipy.stats import rankdata, skew as _skew
 from typing import Tuple
 
-warnings.filterwarnings("ignore")
-
 START_DATE = "1980-01-01"
 END_DATE   = "2024-12-31"
+DOWNLOAD_END = "2025-01-01"  # Yahoo's end date is exclusive.
+CACHE_VERSION = 2
+CHAR_NAMES = [
+    "mom1", "mom6", "mom12", "vol12", "beta12", "ivol12", "log_mktcap",
+    "mom3", "mom9", "mom36", "vol1", "vol6", "beta36", "beta_down",
+    "max_ret", "min_ret", "high52", "skew1", "skew3", "amihud", "turn1",
+]
 MIN_MONTHS = 60          # minimum valid monthly observations to keep a stock
 MAX_FILL   = 3           # max consecutive NaN months to forward-fill
 TRAIN_END  = "2009-12-31"
@@ -46,7 +51,7 @@ def download_monthly_returns(tickers: list[str],
             raw = yf.download(
                 batch,
                 start=START_DATE,
-                end=END_DATE,
+                end=DOWNLOAD_END,
                 auto_adjust=True,
                 progress=False,
                 threads=True,
@@ -59,12 +64,14 @@ def download_monthly_returns(tickers: list[str],
         except Exception as e:
             print(f"  Batch {i}–{i+batch_size} failed: {e}")
 
+    if not monthly_px_list:
+        raise RuntimeError("No price batches were downloaded successfully.")
     prices = pd.concat(monthly_px_list, axis=1)
     prices = prices.loc[~prices.index.duplicated(keep="first")]
 
     # Forward-fill short gaps, then compute returns
     prices_filled = prices.ffill(limit=MAX_FILL)
-    returns = prices_filled.pct_change().iloc[1:]  # drop first NaN row
+    returns = prices_filled.pct_change(fill_method=None).iloc[1:]
 
     # Drop stocks with too few observations
     valid_counts = returns.notna().sum(axis=0)
@@ -81,12 +88,12 @@ def download_monthly_returns(tickers: list[str],
 def download_market_and_rf() -> Tuple[pd.Series, pd.Series]:
     """downloads ^GSPC monthly returns and FRED TB3MS risk-free rate. returns (mkt_ret, rf)."""
     print("Downloading market index (^GSPC) …")
-    gspc = yf.download("^GSPC", start=START_DATE, end=END_DATE,
+    gspc = yf.download("^GSPC", start=START_DATE, end=DOWNLOAD_END,
                        auto_adjust=True, progress=False)["Close"]
     # Newer yfinance may return a single-column DataFrame; squeeze to Series
     if isinstance(gspc, pd.DataFrame):
         gspc = gspc.squeeze()
-    mkt_ret = gspc.resample("ME").last().pct_change().iloc[1:]
+    mkt_ret = gspc.resample("ME").last().pct_change(fill_method=None).iloc[1:]
     mkt_ret.name = "mkt"
 
     print("Downloading risk-free rate from FRED (TB3MS) …")
@@ -108,7 +115,7 @@ def download_market_and_rf() -> Tuple[pd.Series, pd.Series]:
 
 
 def download_shares_outstanding(tickers: list[str],
-                                 cache_path: str = "data/raw/shares_cache.pkl",
+                                 cache_path: str = "data/raw/shares_cache_v2.pkl",
                                  ) -> pd.DataFrame:
     """downloads monthly shares outstanding per ticker; falls back to current scalar if history unavailable. returns (T_months, N_tickers) df."""
     import os, pickle
@@ -135,6 +142,7 @@ def download_shares_outstanding(tickers: list[str],
                 if shares_ts is not None and len(shares_ts) > 0:
                     # Resample to month-end, forward-fill gaps within the series,
                     # then reindex to the full monthly grid and forward-fill again.
+                    shares_ts.index = shares_ts.index.tz_localize(None)
                     s = shares_ts.resample("ME").last().ffill()
                     s = s.reindex(all_months, method="ffill")
                     shares_dict[ticker] = s
@@ -142,7 +150,8 @@ def download_shares_outstanding(tickers: list[str],
                     raise ValueError("empty series")
             except Exception:
                 # Fall back to current scalar from .info; broadcast across all
-                # dates.  Less accurate historically but unavoidable.
+                # dates. This introduces look-ahead bias; retained as an explicit
+                # limitation of this exploratory dataset, not point-in-time data.
                 try:
                     current = yf.Ticker(ticker).info.get("sharesOutstanding", None)
                     if current is not None:
@@ -170,7 +179,7 @@ def download_shares_outstanding(tickers: list[str],
 
 
 def download_daily_data(tickers: list[str],
-                        cache_path: str = "data/raw/daily_cache.pkl",
+                        cache_path: str = "data/raw/daily_cache_v2.pkl",
                         ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """downloads daily adjusted-close and volume; used for vol1, max_ret, amihud, etc. returns (daily_prices, daily_volume)."""
     import os, pickle
@@ -192,7 +201,7 @@ def download_daily_data(tickers: list[str],
             raw = yf.download(
                 batch,
                 start=START_DATE,
-                end=END_DATE,
+                end=DOWNLOAD_END,
                 auto_adjust=True,
                 progress=False,
                 threads=True,
@@ -208,6 +217,8 @@ def download_daily_data(tickers: list[str],
         except Exception as e:
             print(f"  Daily batch {i}–{i + batch_size} failed: {e}")
 
+    if not price_list:
+        raise RuntimeError("No daily price batches were downloaded successfully.")
     daily_prices = pd.concat(price_list,  axis=1)
     daily_volume = pd.concat(volume_list, axis=1)
     daily_prices = daily_prices.loc[:, ~daily_prices.columns.duplicated()]
@@ -223,6 +234,30 @@ def download_daily_data(tickers: list[str],
     return daily_prices, daily_volume
 
 
+def _compound_window(window: np.ndarray) -> np.ndarray:
+    """Compound complete return windows; missing history is not a zero return."""
+    return np.where(np.isfinite(window).all(axis=0),
+                    np.prod(1 + window, axis=0) - 1, np.nan)
+
+
+def _market_regression(stock: np.ndarray, market: np.ndarray):
+    """Per-stock OLS with intercept, using paired finite observations."""
+    valid = np.isfinite(stock) & np.isfinite(market[:, None])
+    count = valid.sum(axis=0)
+    denom = np.maximum(count, 1)
+    x_mean = np.where(valid, market[:, None], 0).sum(axis=0) / denom
+    y_mean = np.where(valid, stock, 0).sum(axis=0) / denom
+    dx = np.where(valid, market[:, None] - x_mean, 0)
+    dy = np.where(valid, stock - y_mean, 0)
+    ss_x = (dx ** 2).sum(axis=0)
+    beta = np.divide((dx * dy).sum(axis=0), ss_x,
+                     out=np.full(stock.shape[1], np.nan), where=(count >= 3) & (ss_x > 0))
+    residual = np.where(valid, dy - beta * dx, 0)
+    ivol = np.where(count >= 3,
+                    np.sqrt((residual ** 2).sum(axis=0) / np.maximum(count - 2, 1)), np.nan)
+    return beta, ivol
+
+
 def compute_characteristics(returns: pd.DataFrame,
                              mkt_ret: pd.Series,
                              rf: pd.Series,
@@ -231,7 +266,10 @@ def compute_characteristics(returns: pd.DataFrame,
                              daily_prices: pd.DataFrame = None,
                              daily_volume: pd.DataFrame = None,
                              ) -> np.ndarray:
-    """computes 21 lagged firm characteristics (momentum, vol, beta, mktcap, daily stats) and cross-sectionally rank-normalizes each to [-1, 1]. returns (N, T, 21) array."""
+    """Compute 21 lagged characteristics from RAW returns, ranked to [-1, 1].
+    Risk-free returns are subtracted here only for market regressions.
+    Returns an (N, T, 21) array.
+    """
     T, N = returns.shape
     dates   = returns.index
     tickers = returns.columns
@@ -299,12 +337,12 @@ def compute_characteristics(returns: pd.DataFrame,
         # [1] mom6: cumulative return [t-7, t-2]
         w6 = ret[t - 7 : t - 1, :]
         if w6.shape[0] == 6:
-            chars_raw[t, :, 1] = np.nanprod(1 + w6, axis=0) - 1
+            chars_raw[t, :, 1] = _compound_window(w6)
 
         # [2] mom12: cumulative return [t-13, t-2]
         w12 = ret[t - 13 : t - 1, :]
         if w12.shape[0] == 12:
-            chars_raw[t, :, 2] = np.nanprod(1 + w12, axis=0) - 1
+            chars_raw[t, :, 2] = _compound_window(w12)
 
         # [3] vol12
         chars_raw[t, :, 3] = np.nanstd(ret[t - 12 : t, :], axis=0, ddof=1)
@@ -312,28 +350,20 @@ def compute_characteristics(returns: pd.DataFrame,
         # [4] beta12 + [5] ivol12: OLS market regression over 12 months
         ew12 = exc_ret[t - 12 : t, :]
         mw12 = mkt_exc[t - 12 : t]
-        mv12 = np.nanvar(mw12, ddof=1)
-        if mv12 > 0:
-            cov12 = (np.nanmean(ew12 * mw12[:, None], axis=0)
-                     - np.nanmean(ew12, axis=0) * np.nanmean(mw12))
-            b12 = cov12 / mv12
-            chars_raw[t, :, 4] = b12
-            a12 = np.nanmean(ew12, axis=0) - b12 * np.nanmean(mw12)
-            resid12 = ew12 - a12[None, :] - b12[None, :] * mw12[:, None]
-            chars_raw[t, :, 5] = np.nanstd(resid12, axis=0, ddof=2)
+        chars_raw[t, :, 4], chars_raw[t, :, 5] = _market_regression(ew12, mw12)
 
         # [7] mom3: cumulative return [t-4, t-2]
-        chars_raw[t, :, 7] = np.nanprod(1 + ret[t - 4 : t - 1, :], axis=0) - 1
+        chars_raw[t, :, 7] = _compound_window(ret[t - 4 : t - 1, :])
 
         # [8] mom9: cumulative return [t-10, t-2]
         if t >= 10:
             chars_raw[t, :, 8] = (
-                np.nanprod(1 + ret[t - 10 : t - 1, :], axis=0) - 1)
+                _compound_window(ret[t - 10 : t - 1, :]))
 
         # [9] mom36: cumulative return [t-37, t-13] (24-month window, t≥37)
         if t >= 37:
             chars_raw[t, :, 9] = (
-                np.nanprod(1 + ret[t - 37 : t - 13, :], axis=0) - 1)
+                _compound_window(ret[t - 37 : t - 13, :]))
 
         # [11] vol6
         chars_raw[t, :, 11] = np.nanstd(ret[t - 6 : t, :], axis=0, ddof=1)
@@ -342,11 +372,7 @@ def compute_characteristics(returns: pd.DataFrame,
         if t >= 36:
             ew36 = exc_ret[t - 36 : t, :]
             mw36 = mkt_exc[t - 36 : t]
-            mv36 = np.nanvar(mw36, ddof=1)
-            if mv36 > 0:
-                cov36 = (np.nanmean(ew36 * mw36[:, None], axis=0)
-                         - np.nanmean(ew36, axis=0) * np.nanmean(mw36))
-                chars_raw[t, :, 12] = cov36 / mv36
+            chars_raw[t, :, 12], _ = _market_regression(ew36, mw36)
 
         # [13] beta_down: downside beta, 60-month window, ≥12 negative mkt months
         if t >= 60:
@@ -356,11 +382,9 @@ def compute_characteristics(returns: pd.DataFrame,
             if dmask.sum() >= 12:
                 mw_d = mw60[dmask]
                 ew_d = ew60[dmask, :]
-                mv_d = np.nanvar(mw_d, ddof=1)
-                if mv_d > 0:
-                    cov_d = (np.nanmean(ew_d * mw_d[:, None], axis=0)
-                             - np.nanmean(ew_d, axis=0) * np.nanmean(mw_d))
-                    chars_raw[t, :, 13] = cov_d / mv_d
+                beta_d, _ = _market_regression(ew_d, mw_d)
+                beta_d[np.isfinite(ew_d).sum(axis=0) < 12] = np.nan
+                chars_raw[t, :, 13] = beta_d
 
         # daily characteristics (skipped if daily data not provided)
         if not have_daily:
@@ -377,7 +401,7 @@ def compute_characteristics(returns: pd.DataFrame,
         dr_21 = dr_arr[t21s : t1 + 1, :]   # (≤21, N)
         dv_21 = dv_arr[t21s : t1 + 1, :]   # (≤21, N)
 
-        # [10] vol1: annualised daily vol × √21
+        # [10] vol1: daily volatility scaled to a 21-trading-day month
         chars_raw[t, :, 10] = np.nanstd(dr_21, axis=0, ddof=1) * np.sqrt(21)
 
         # [14] max_ret / [15] min_ret over 21-day window
@@ -431,7 +455,7 @@ def compute_characteristics(returns: pd.DataFrame,
     for t in range(T):
         for p in range(P_total):
             x       = chars_raw[t, :, p]
-            valid   = ~np.isnan(x)
+            valid   = np.isfinite(x)
             n_valid = valid.sum()
             if n_valid < 2:
                 continue
@@ -460,6 +484,8 @@ def time_split(returns: pd.DataFrame,
                         ("val",   val_mask),
                         ("test",  test_mask)]:
         idx = np.where(mask)[0]
+        if len(idx) == 0:
+            raise ValueError(f"The {name} split is empty; check the data date range.")
         splits[name] = {
             "returns": returns.iloc[idx],        # (T_split, N)
             "chars":   chars[:, idx, :],         # (N, T_split, P)
@@ -471,7 +497,8 @@ def time_split(returns: pd.DataFrame,
     return splits
 
 
-def load_data(cache_path: str = "data/raw/data_cache.pkl") -> dict:
+def load_data(cache_path: str = "data/raw/data_cache_v2.pkl",
+              allow_legacy_cache: bool = False) -> dict:
     """runs the full data pipeline (tickers → returns → chars → splits) and caches the result. returns dict with keys 'splits', 'returns', 'chars', 'dates', 'tickers'."""
     import os, pickle
 
@@ -480,7 +507,13 @@ def load_data(cache_path: str = "data/raw/data_cache.pkl") -> dict:
         with open(cache_path, "rb") as f:
             cached = pickle.load(f)
         cached_p = cached.get("chars", np.array([])).shape
-        if len(cached_p) == 3 and cached_p[2] == 21:
+        if len(cached_p) == 3 and cached_p[2] == len(CHAR_NAMES):
+            if cached.get("cache_version") != CACHE_VERSION:
+                if not allow_legacy_cache:
+                    raise ValueError("Legacy data cache uses the old characteristic pipeline. "
+                                     "Choose a new --cache path to rebuild, or explicitly use "
+                                     "--allow-legacy-cache for historical diagnostics.")
+                warnings.warn("Using legacy characteristics; results are not a corrected replication.")
             print(f"  Cache valid: P={cached_p[2]}, "
                   f"T={cached_p[1]}, N={cached_p[0]}.")
             return cached
@@ -506,20 +539,18 @@ def load_data(cache_path: str = "data/raw/data_cache.pkl") -> dict:
     excess_returns = raw_returns.subtract(rf, axis=0)
 
     print("Downloading shares outstanding …")
-    shares = download_shares_outstanding(tickers)
+    shares = download_shares_outstanding(tickers, os.path.join(os.path.dirname(cache_path), "shares_cache_v2.pkl"))
     shares = shares.reindex(index=common_dates, columns=raw_returns.columns)
 
     print("Downloading daily prices and volume …")
-    daily_prices, daily_volume = download_daily_data(tickers)
+    daily_prices, daily_volume = download_daily_data(tickers, os.path.join(os.path.dirname(cache_path), "daily_cache_v2.pkl"))
     # Restrict daily data to the stock universe that survived the quality filter
     daily_prices = daily_prices.reindex(columns=raw_returns.columns)
     daily_volume = daily_volume.reindex(columns=raw_returns.columns)
 
     print("Computing firm characteristics …")
-    # Use excess_returns so momentum signals are consistent with the return
-    # target — both strip out the risk-free rate, ensuring characteristics and
-    # predicted returns are measured on the same basis.
-    chars = compute_characteristics(excess_returns, mkt_ret, rf,
+    # Characteristic regressions subtract rf internally; pass raw returns once.
+    chars = compute_characteristics(raw_returns, mkt_ret, rf,
                                     prices=raw_prices, shares=shares,
                                     daily_prices=daily_prices,
                                     daily_volume=daily_volume)
@@ -533,9 +564,11 @@ def load_data(cache_path: str = "data/raw/data_cache.pkl") -> dict:
         "chars":   chars,
         "dates":   common_dates,
         "tickers": list(raw_returns.columns),
+        "cache_version": CACHE_VERSION,
+        "characteristic_names": CHAR_NAMES,
     }
 
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
     with open(cache_path, "wb") as f:
         import pickle as pk
         pk.dump(result, f)

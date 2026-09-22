@@ -50,57 +50,30 @@ def predictive_r2(r_true_test: np.ndarray,
     return total_r2(r_true_test, r_hat_test)
 
 
-def factor_sharpe(r_true_test: np.ndarray,
-                  r_hat_test: np.ndarray,
-                  annualize: int = 12) -> float:
-    """annualized Sharpe of a long-short decile portfolio. params: {r_true_test: (T,N), r_hat_test: (T,N), annualize: int}. returns float.
-
-    each month: long top-decile predicted, short bottom-decile predicted, equal-weight within each leg.
-    """
-    T, N = r_true_test.shape
-
-    # return NaN instead of 0 if predictions are globally flat (collapsed model)
-    pred_cs_std  = np.nanstd(r_hat_test, axis=1)
-    mean_cs_std  = float(np.nanmean(pred_cs_std))
-    if mean_cs_std < 1e-6:
+def factor_sharpe(r_true_test, r_hat_test, annualize=12):
+    """Annualized Sharpe of the same monthly decile spread used in all plots/tests."""
+    port = get_portfolio_returns(r_true_test, r_hat_test)
+    port = port[np.isfinite(port)]
+    if len(port) < 2 or port.std(ddof=1) < 1e-10:
         return np.nan
+    return float(port.mean() / port.std(ddof=1) * np.sqrt(annualize))
 
-    port_returns = np.full(T, np.nan)
 
-    for t in range(T):
-        r_t     = r_true_test[t]
-        r_hat_t = r_hat_test[t]
+def predictions_collapsed(r_true, r_hat):
+    """Flat cross sections, distinct from insufficient observations for Sharpe."""
+    spreads = [np.std(pred[valid]) for ret, pred in zip(r_true, r_hat)
+               if (valid := _safe_mask(ret, pred)).sum() >= 2]
+    return bool(spreads) and float(np.mean(spreads)) < 1e-6
 
-        valid = _safe_mask(r_t, r_hat_t)
-        if valid.sum() < 20:
-            continue
 
-        pred_valid = r_hat_t[valid]
-        ret_valid  = r_t[valid]
-
-        # skip months where all predictions are essentially equal
-        if pred_valid.std() < 1e-6:
-            continue
-
-        q10 = np.percentile(pred_valid, 10)
-        q90 = np.percentile(pred_valid, 90)
-
-        long_mask  = pred_valid >= q90
-        short_mask = pred_valid <= q10
-
-        if long_mask.sum() == 0 or short_mask.sum() == 0:
-            continue
-
-        long_ret  = ret_valid[long_mask].mean()
-        short_ret = ret_valid[short_mask].mean()
-        port_returns[t] = long_ret - short_ret
-
-    valid_returns = port_returns[~np.isnan(port_returns)]
-    if len(valid_returns) < 2:
-        return np.nan
-
-    sr = valid_returns.mean() / (valid_returns.std(ddof=1) + 1e-10)
-    return float(sr * np.sqrt(annualize))
+def evaluation_splits(splits):
+    """Use one characteristic-complete test panel for every model family."""
+    result = dict(splits)
+    test = dict(splits["test"])
+    valid_chars = np.isfinite(test["chars"]).all(axis=2).T
+    test["returns"] = test["returns"].where(valid_chars)
+    result["test"] = test
+    return result
 
 
 def nonlinear_contribution(model: CAEModel,
@@ -108,15 +81,14 @@ def nonlinear_contribution(model: CAEModel,
                            chars: np.ndarray) -> Tuple[float, float, float]:
     """decompose ResCAE loading variance into linear and nonlinear parts. params: {model: CAEModel, returns: (T,N), chars: (N,T,P)}. returns (var_lin, var_nonlin, frac_nonlin).
 
-    φ = var_nonlin / (var_lin + var_nonlin); high φ means g(z) captures variation the linear term misses.
+    φ = var_nonlin / (var_lin + var_nonlin). This branch variance ratio excludes
+    covariance, and is not a share of explained returns or proof of nonlinearity.
     """
     var_lin, var_nonlin = model.get_nonlinear_contribution(returns, chars)
 
-    # both vars == 0 signals a collapsed model; φ is undefined in that case
-    if var_lin < 1e-10 and var_nonlin < 1e-10:
-        return 0.0, 0.0, np.nan
-
-    total = var_lin + var_nonlin + 1e-10
+    total = var_lin + var_nonlin
+    if not np.isfinite(total) or total <= 0:
+        return var_lin, var_nonlin, np.nan
     frac_nonlin = var_nonlin / total
     return var_lin, var_nonlin, float(frac_nonlin)
 
@@ -137,14 +109,6 @@ def compute_ipca_drift(model) -> Optional[float]:
             return None
         drift = float(np.linalg.norm(w - gamma, "fro") / denom)
 
-    if drift is not None and drift > 1.0:
-        import warnings
-        warnings.warn(
-            f"W_skip drift = {drift:.4f} > 1.0. The IPCA initialization was "
-            f"effectively discarded during training. The phi decomposition is "
-            f"not interpretable for this configuration.",
-            UserWarning, stacklevel=2,
-        )
     return drift
 
 
@@ -168,169 +132,69 @@ def oos_pricing_error(r_true: np.ndarray, r_hat: np.ndarray) -> float:
     return float(np.sqrt((finite ** 2).mean()))
 
 
-def _best_key_per_k(model_dict: dict, pkl_path: str) -> dict:
-    """return {k: best_key} selecting by lowest pred_val_mse, falling back to val_losses if absent."""
+def _best_key_per_k(model_dict, pkl_path):
+    """Select by saved validation scores; never silently pick an arbitrary config."""
     import os, pickle
-    scores: dict = {}
+    if not model_dict:
+        return {}
+    scores = {}
     if os.path.exists(pkl_path):
-        with open(pkl_path, "rb") as _f:
-            data = pickle.load(_f)
+        with open(pkl_path, "rb") as f:
+            data = pickle.load(f)
         scores = data.get("pred_val_mse") or data.get("val_losses", {})
-
-    best: dict = {}
-    for key in model_dict:
-        k = key[0]
-        score = scores.get(key, float("inf"))
-        if k not in best or score < scores.get(best[k], float("inf")):
-            best[k] = key
+    best = {}
+    for k in sorted({key[0] for key in model_dict}):
+        keys = [key for key in model_dict if key[0] == k]
+        available = [key for key in keys if np.isfinite(scores.get(key, np.nan))]
+        if available:
+            best[k] = min(available, key=scores.get)
+        elif len(keys) == 1:
+            best[k] = keys[0]
+        else:
+            raise ValueError(f"Missing validation scores for K={k}: {pkl_path}")
     return best
 
 
-def build_summary_table(splits: dict,
-                        models: dict,
-                        results_dir: str = "results",
-                        ) -> pd.DataFrame:
-    """compute all metrics for the best-λ config per (model family, K) on the test set. params: {splits: dict, models: dict, results_dir: str}. returns pd.DataFrame.
-
-    model order: PCA → IPCA → ResCAE → CAE-NL. IPCA rows are NaN placeholders if models["ipca"] is absent.
-    """
+def build_summary_table(splits, models, results_dir="results", all_configs=False):
+    """Test metrics on one common panel; keep numeric metrics at full precision."""
     import os
-    test_ret    = splits["test"]["returns"].values.astype(np.float32)
-    test_chars  = splits["test"]["chars"].astype(np.float32)
-    train_ret   = splits["train"]["returns"].values.astype(np.float32)
+    splits = evaluation_splits(splits)
+    test_ret = splits["test"]["returns"].values.astype(np.float32)
+    test_chars = splits["test"]["chars"].astype(np.float32)
+    train_ret = splits["train"]["returns"].values.astype(np.float32)
     train_chars = splits["train"]["chars"].astype(np.float32)
-
     rows = []
-
-    # PCA
-    for k, model in sorted(models["pca"].items()):
-        r_hat_in  = model.reconstruct(test_ret).astype(np.float32)
-        r_hat_oos = model.predict(test_ret, train_returns=train_ret).astype(np.float32)
-        rows.append({"Model": "PCA", "K": k, "λ_lin": "-", "λ_nonlin": "-",
-                     "Total_R2": total_r2(test_ret, r_hat_in),
-                     "Pred_R2":  predictive_r2(test_ret, r_hat_oos),
-                     "Sharpe":   factor_sharpe(test_ret, r_hat_oos),
-                     "CSPE":     oos_pricing_error(test_ret, r_hat_oos),
-                     "NL_frac":  "-", "drift_rel": "-"})
-
-    # IPCA
-    if "ipca" in models:
-        for k, model in sorted(models["ipca"].items()):
-            r_hat_in  = model.reconstruct(test_ret, test_chars).astype(np.float32)
-            r_hat_oos = model.predict(
-                test_ret, test_chars,
-                train_returns=train_ret, train_chars=train_chars,
-            ).astype(np.float32)
-            rows.append({"Model": "IPCA", "K": k, "λ_lin": "-", "λ_nonlin": "-",
-                         "Total_R2": total_r2(test_ret, r_hat_in),
-                         "Pred_R2":  predictive_r2(test_ret, r_hat_oos),
-                         "Sharpe":   factor_sharpe(test_ret, r_hat_oos),
-                         "CSPE":     oos_pricing_error(test_ret, r_hat_oos),
-                         "NL_frac":  "-", "drift_rel": "-"})
-    else:
-        for k in sorted(models["pca"].keys()):
-            rows.append({"Model": "IPCA", "K": k, "λ_lin": "-", "λ_nonlin": "-",
-                         "Total_R2": np.nan, "Pred_R2": np.nan,
-                         "Sharpe":   np.nan, "CSPE":    np.nan,
-                         "NL_frac":  "-",    "drift_rel": "-"})
-
-    # ResCAE-Fixed — best λ_nonlin per K
-    if "cae_fixed" in models and models["cae_fixed"]:
-        fixed_best = _best_key_per_k(
-            models["cae_fixed"],
-            os.path.join(results_dir, "cae_fixed_hparam_search.pkl"),
-        )
-        for k, key in sorted(fixed_best.items()):
-            _, lam_nonlin = key
-            model = models["cae_fixed"][key]
-            r_hat_in  = model.reconstruct(test_ret, test_chars).astype(np.float32)
-            r_hat_oos = model.predict(
-                test_ret, test_chars,
-                train_returns=train_ret, train_chars=train_chars,
-            ).astype(np.float32)
-            _, _, nl_frac = nonlinear_contribution(model, test_ret, test_chars)
-            rows.append({"Model": "ResCAE-Fixed", "K": k,
-                         "λ_lin": "frozen", "λ_nonlin": f"{lam_nonlin:.0e}",
-                         "Total_R2": total_r2(test_ret, r_hat_in),
-                         "Pred_R2":  predictive_r2(test_ret, r_hat_oos),
-                         "Sharpe":   factor_sharpe(test_ret, r_hat_oos),
-                         "CSPE":     oos_pricing_error(test_ret, r_hat_oos),
-                         "NL_frac":  f"{nl_frac:.3f}",
-                         "drift_rel": "0.0000"})
-
-    # ResCAE — best λ per K
-    cae_best = _best_key_per_k(
-        models["cae"],
-        os.path.join(results_dir, "cae_hparam_search.pkl"),
-    )
-    for k, key in sorted(cae_best.items()):
-        _, lam_lin, lam_nonlin = key
-        model = models["cae"][key]
-        r_hat_in  = model.reconstruct(test_ret, test_chars).astype(np.float32)
-        r_hat_oos = model.predict(
-            test_ret, test_chars,
-            train_returns=train_ret, train_chars=train_chars,
-        ).astype(np.float32)
-        _, _, nl_frac = nonlinear_contribution(model, test_ret, test_chars)
-        drift = compute_ipca_drift(model)
-        drift_capped = (drift is not None and drift > 1.0)
-        drift_display = (f"{min(drift, 1.0):.4f}{'*' if drift_capped else ''}"
-                         if drift is not None else None)
-        rows.append({"Model": "ResCAE", "K": k,
-                     "λ_lin": f"{lam_lin:.0e}", "λ_nonlin": f"{lam_nonlin:.0e}",
-                     "Total_R2": total_r2(test_ret, r_hat_in),
-                     "Pred_R2":  predictive_r2(test_ret, r_hat_oos),
-                     "Sharpe":   factor_sharpe(test_ret, r_hat_oos),
-                     "CSPE":     oos_pricing_error(test_ret, r_hat_oos),
-                     "NL_frac":  f"{nl_frac:.3f}" if np.isfinite(nl_frac) else "N/A",
-                     "drift_rel":   drift_display,
-                     "drift_capped": drift_capped})
-
-    # CAE-NL — best λ_nonlin per K (robustness)
-    cae_nl_best = _best_key_per_k(
-        models.get("cae_nl", {}),
-        os.path.join(results_dir, "cae_nl_hparam_search.pkl"),
-    )
-    for k, key in sorted(cae_nl_best.items()):
-        _, lam_nonlin = key
-        model = models["cae_nl"][key]
-        r_hat_in  = model.reconstruct(test_ret, test_chars).astype(np.float32)
-        r_hat_oos = model.predict(
-            test_ret, test_chars,
-            train_returns=train_ret, train_chars=train_chars,
-        ).astype(np.float32)
-        _, _, nl_frac = nonlinear_contribution(model, test_ret, test_chars)
-        rows.append({"Model": "CAE-NL (robustness)", "K": k,
-                     "λ_lin": "-", "λ_nonlin": f"{lam_nonlin:.0e}",
-                     "Total_R2": total_r2(test_ret, r_hat_in),
-                     "Pred_R2":  predictive_r2(test_ret, r_hat_oos),
-                     "Sharpe":   factor_sharpe(test_ret, r_hat_oos),
-                     "CSPE":     oos_pricing_error(test_ret, r_hat_oos),
-                     "NL_frac":  f"{nl_frac:.3f}",
-                     "drift_rel": "-"})
-
+    labels = {"pca": "PCA", "ipca": "IPCA", "ae": "AE", "cae_fixed": "ResCAE-Fixed",
+              "cae": "ResCAE", "cae_nl": "CAE-NL (robustness)"}
+    for family, label in labels.items():
+        configs = models.get(family, {})
+        conditional = family in ("cae", "cae_fixed", "cae_nl")
+        best = (_best_key_per_k(configs, os.path.join(results_dir, f"{family}_hparam_search.pkl"))
+                if conditional else {})
+        keys = configs if all_configs or not conditional else best.values()
+        for key in keys:
+            model = configs[key]
+            k = key[0] if conditional else key
+            if family in ("pca", "ae"):
+                rec = model.reconstruct(test_ret)
+                pred = model.predict(test_ret, train_returns=train_ret)
+            else:
+                rec = model.reconstruct(test_ret, test_chars)
+                pred = model.predict(test_ret, test_chars, train_ret, train_chars)
+            collapsed = predictions_collapsed(test_ret, pred)
+            phi = nonlinear_contribution(model, test_ret, test_chars)[2] if conditional else np.nan
+            rows.append({"Model": label, "K": k,
+                         "λ_lin": key[1] if family == "cae" else ("frozen" if family == "cae_fixed" else np.nan),
+                         "λ_nonlin": key[-1] if conditional else np.nan,
+                         "Total_R2": total_r2(test_ret, rec), "Pred_R2": predictive_r2(test_ret, pred),
+                         "Sharpe": factor_sharpe(test_ret, pred), "CSPE": oos_pricing_error(test_ret, pred),
+                         "NL_frac": np.nan if collapsed else phi,
+                         "drift_rel": compute_ipca_drift(model) if conditional else np.nan,
+                         "Collapsed": collapsed, "N_predictions": int(_safe_mask(test_ret, pred).sum()),
+                         "selected_by_validation": not conditional or key == best[k]})
     df = pd.DataFrame(rows)
-
-    # collapsed models have NaN Sharpe from flat predictions
-    sharpe_numeric = pd.to_numeric(df["Sharpe"], errors="coerce")
-    df["Collapsed"] = sharpe_numeric.isna() & df["Model"].isin(
-        ["CAE-NL (robustness)", "ResCAE", "ResCAE-Fixed"])
-
-    # collapsed Sharpe → "COLLAPSED", undefined phi → "N/A"
-    for col in ["Total_R2", "Pred_R2", "CSPE"]:
-        df[col] = df[col].apply(lambda x: f"{x:.4f}" if isinstance(x, float) else x)
-    df["Sharpe"] = df.apply(
-        lambda row: "COLLAPSED" if row["Collapsed"] and pd.isna(row["Sharpe"])
-                    else (f"{row['Sharpe']:.4f}" if isinstance(row["Sharpe"], float) else row["Sharpe"]),
-        axis=1)
-    df["NL_frac"] = df["NL_frac"].apply(
-        lambda x: "N/A" if (isinstance(x, float) and np.isnan(x)) else x)
-
-    model_order = {"PCA": 0, "IPCA": 1, "ResCAE-Fixed": 2,
-                   "ResCAE": 3, "CAE-NL (robustness)": 4}
-    df["_order"] = df["Model"].map(model_order)
-    df = df.sort_values(["K", "_order"]).drop(columns="_order")
-    return df
+    df["_order"] = df["Model"].map({name: i for i, name in enumerate(labels.values())})
+    return df.sort_values(["K", "_order"]).drop(columns="_order").reset_index(drop=True)
 
 
 def _save_fig(fig: plt.Figure, base_path: str, dpi: int = 200) -> None:
@@ -344,36 +208,27 @@ def _save_fig(fig: plt.Figure, base_path: str, dpi: int = 200) -> None:
     print(f"  → {png_path}")
 
 
-def plot_loss_curves(results_dir: str = "results",
-                     figures_dir: str = "paper/figures") -> None:
-    """plot train/val loss curves from saved checkpoints."""
-    import os, glob, torch
-
-    os.makedirs(figures_dir, exist_ok=True)
-    ckpt_files = glob.glob(os.path.join(results_dir, "*.pt"))
-    if not ckpt_files:
-        print("  No checkpoint files found; skipping loss curve plots.")
+def plot_loss_curves(results_dir="results", figures_dir="paper/figures"):
+    """Overlay training/validation histories by family without one subplot per seed."""
+    import json
+    from pathlib import Path
+    path = Path(results_dir) / "loss_histories.json"
+    if not path.exists():
+        print("  No saved loss histories; skipping loss curves.")
         return
-
-    fig, axes = plt.subplots(len(ckpt_files), 1,
-                              figsize=(8, 3 * len(ckpt_files)),
-                              squeeze=False)
-
-    for ax, ckpt_path in zip(axes[:, 0], sorted(ckpt_files)):
-        ckpt   = torch.load(ckpt_path, map_location="cpu")
-        label  = os.path.basename(ckpt_path).replace(".pt", "")
-        ax.plot(ckpt.get("train_losses", []), label="Train")
-        ax.plot(ckpt.get("val_losses",   []), label="Val")
-        ax.set_title(label, fontsize=11)
-        ax.set_xlabel("Epoch", fontsize=9)
-        ax.set_ylabel("MSE Loss", fontsize=9)
-        ax.legend(fontsize=9)
-
+    histories = json.loads(path.read_text())
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    for ax, family in zip(axes.flat, ("ae", "cae", "cae_fixed", "cae_nl")):
+        for i, (name, history) in enumerate((name, history) for name, history in histories.items()
+                                           if name.startswith(family + " ")):
+            ax.plot(history["train_losses"], color="steelblue", alpha=0.3,
+                    label="Train (includes L1 for CAE)" if i == 0 else None)
+            ax.plot(history["val_losses"], color="darkorange", alpha=0.3,
+                    label="Validation reconstruction MSE" if i == 0 else None)
+        ax.set(title=family, xlabel="Epoch", ylabel="Loss (orthogonality step excluded)")
+        ax.legend(fontsize=8)
     fig.tight_layout()
-    out = os.path.join(figures_dir, "loss_curves.png")
-    fig.savefig(out, dpi=200)
-    plt.close(fig)
-    print(f"  Loss curves → {out}")
+    _save_fig(fig, str(Path(figures_dir) / "loss_curves.png"))
 
 
 def plot_summary_heatmap(summary_df: pd.DataFrame,
@@ -391,7 +246,7 @@ def plot_summary_heatmap(summary_df: pd.DataFrame,
     pivot_r2 = df.pivot_table(index="Model", columns="K",
                                values="Total_R2", aggfunc="mean")
     pivot_sr = df.pivot_table(index="Model", columns="K",
-                               values="Sharpe", aggfunc="mean")
+                               values="Sharpe", aggfunc="mean").reindex(index=pivot_r2.index, columns=pivot_r2.columns)
     # boolean pivot for collapsed cells (all-NaN Sharpe per group)
     if collapsed_mask.any():
         pivot_col = df.pivot_table(index="Model", columns="K",
@@ -481,27 +336,20 @@ def plot_factor_portfolios(splits: dict,
     }
 
     def _port_ts(r_true, r_hat, label, color, lw=1.8, ls="-"):
-        T = r_true.shape[0]
-        port = []
-        for t in range(T):
-            r_t  = r_true[t]
-            rh   = r_hat[t]
-            valid = _safe_mask(r_t, rh)
-            if valid.sum() < 20:
-                port.append(np.nan)
-                continue
-            pv = rh[valid]; rv = r_t[valid]
-            q10 = np.percentile(pv, 10); q90 = np.percentile(pv, 90)
-            lng = rv[pv >= q90].mean() if (pv >= q90).any() else np.nan
-            sht = rv[pv <= q10].mean() if (pv <= q10).any() else np.nan
-            port.append(lng - sht)
-        cum = np.nancumsum(np.array(port, dtype=float))
-        ax.plot(test_dates[:len(cum)], cum, label=label,
-                color=color, lw=lw, linestyle=ls)
+        port = get_portfolio_returns(r_true, r_hat)
+        if not np.isfinite(port).any():
+            return
+        cumulative = np.nancumsum(port)
+        cumulative[~np.isfinite(port)] = np.nan
+        ax.plot(test_dates, cumulative, label=label, color=color, lw=lw, linestyle=ls)
 
-    # use middle K as a representative
+    # Compare every family at the globally validation-selected ResCAE K.
     k_vals = sorted(models["pca"].keys())
-    k_rep  = k_vals[len(k_vals) // 2]
+    k_rep = best_cae_key[0] if best_cae_key is not None else k_vals[len(k_vals) // 2]
+    if models.get("cae_nl"):
+        best_nl_key = _best_key_per_k(models["cae_nl"], nl_hparam_path).get(k_rep)
+    if models.get("cae_fixed"):
+        best_fixed_key = _best_key_per_k(models["cae_fixed"], fixed_hparam_path).get(k_rep)
 
     if k_rep in models["pca"]:
         _port_ts(test_ret,
@@ -542,15 +390,19 @@ def plot_factor_portfolios(splits: dict,
                  f"CAE-NL K={k_nl} λNL={lam_nl:.0e}  (robustness)",
                  colors["CAE-NL"], lw=1.2, ls="--")
 
+    if k_rep in models.get("ae", {}):
+        _port_ts(test_ret, models["ae"][k_rep].predict(test_ret, train_returns=train_ret),
+                 f"AE K={k_rep}", "firebrick")
+
     bnh = np.nanmean(test_ret, axis=1)
     ax.plot(test_dates, np.nancumsum(bnh),
-            label="Buy & Hold (EW)", color="black", lw=1.0, linestyle=":")
+            label="Monthly equal-weight excess return", color="black", lw=1.0, linestyle=":")
     ax.axhline(0, color="black", lw=0.5)
 
-    ax.set_title("Cumulative Long-Short Portfolio Returns — Test Period 2020–2024",
+    ax.set_title(f"Sum of Monthly Decile Spreads — {test_dates[0]:%Y-%m} to {test_dates[-1]:%Y-%m}",
                  fontsize=13)
     ax.set_xlabel("Date", fontsize=11)
-    ax.set_ylabel("Cumulative Return", fontsize=11)
+    ax.set_ylabel("Arithmetic sum of monthly returns (not compounded)", fontsize=11)
     ax.tick_params(labelsize=9)
     ax.legend(fontsize=9)
 
@@ -583,16 +435,19 @@ def plot_phi_r2_scatter(splits: dict,
                               .get(cae_key, {})
                               .get("dm_vs_ipca", {})
                               .get("p_value", np.nan))
+        improvement = (sig_results.get("per_config", {}).get(cae_key, {})
+                       .get("dm_vs_ipca", {}).get("mean_loss_diff", np.nan))
         drift = compute_ipca_drift(model)
         points.append({"phi": phi, "pred_r2": pr2, "k": k,
                        "lam_nonlin": lam_nonlin, "p_vs_ipca": p_ipca,
+                       "improvement": improvement,
                        "high_drift": (drift is not None and drift > 1.0)})
 
     if not points:
         print("  No ResCAE configs for φ–R² scatter; skipping.")
         return
 
-    # ResCAE-Fixed points: φ identified by construction since W_skip is frozen
+    # ResCAE-Fixed keeps the linear weights frozen; encoder and g still vary.
     fixed_points = []
     for fixed_key, model in models.get("cae_fixed", {}).items():
         k_f, lam_nl_f = fixed_key
@@ -603,17 +458,17 @@ def plot_phi_r2_scatter(splits: dict,
         fixed_points.append({"phi": phi_f, "pred_r2": pr2_f,
                               "k": k_f, "lam_nonlin": lam_nl_f})
 
-    def _col(p):
+    def _col(p, improvement):
         if not np.isfinite(p): return "lightgray"
-        if p < 0.05:           return "seagreen"
-        if p < 0.10:           return "gold"
+        if p < 0.05 and improvement > 0: return "seagreen"
+        if p < 0.10 and improvement > 0: return "gold"
         return "firebrick"
 
     fig, ax = plt.subplots(figsize=(7, 5))
     for pt in points:
         marker = "X" if pt["high_drift"] else "o"
         ax.scatter(pt["pred_r2"], pt["phi"],
-                   color=_col(pt["p_vs_ipca"]),
+                   color=_col(pt["p_vs_ipca"], pt["improvement"]),
                    marker=marker, s=80, edgecolors="black", lw=0.5, zorder=3)
         ax.annotate(f"K={pt['k']}, λNL={pt['lam_nonlin']:.0e}",
                     (pt["pred_r2"], pt["phi"]),
@@ -628,7 +483,7 @@ def plot_phi_r2_scatter(splits: dict,
                     fontsize=7, textcoords="offset points", xytext=(5, -10))
 
     best = max(points, key=lambda x: x["pred_r2"] if np.isfinite(x["pred_r2"]) else -np.inf)
-    ax.annotate(f"Best: K={best['k']}, λNL={best['lam_nonlin']:.0e}",
+    ax.annotate(f"Highest test R² (descriptive): K={best['k']}, λNL={best['lam_nonlin']:.0e}",
                 (best["pred_r2"], best["phi"]),
                 fontsize=8, fontweight="bold",
                 textcoords="offset points", xytext=(10, -12),
@@ -636,16 +491,16 @@ def plot_phi_r2_scatter(splits: dict,
 
     from matplotlib.lines import Line2D as _Line2D
     legend_els = [
-        Patch(facecolor="seagreen",     edgecolor="black", label="ResCAE p < 0.05  (vs IPCA)"),
-        Patch(facecolor="gold",         edgecolor="black", label="ResCAE p < 0.10"),
-        Patch(facecolor="firebrick",    edgecolor="black", label="ResCAE p ≥ 0.10"),
+        Patch(facecolor="seagreen",     edgecolor="black", label="ResCAE improves on IPCA, p < 0.05"),
+        Patch(facecolor="gold",         edgecolor="black", label="ResCAE improves, 0.05 ≤ p < 0.10"),
+        Patch(facecolor="firebrick",    edgecolor="black", label="No significant improvement at 10%"),
         Patch(facecolor="lightgray",    edgecolor="black", label="IPCA not available"),
         _Line2D([0], [0], marker="D", color="w", markerfacecolor="mediumpurple",
                 markeredgecolor="black", markersize=8,
-                label="ResCAE-Fixed (φ by construction)"),
+                label="ResCAE-Fixed (frozen linear weights)"),
         _Line2D([0], [0], marker="X", color="w", markerfacecolor="gray",
                 markeredgecolor="black", markersize=8,
-                label="× = IPCA init discarded (drift > 1.0)"),
+                label="× = relative weight drift > 1.0"),
     ]
     ax.legend(handles=legend_els, fontsize=9)
     ax.set_xlabel("Predictive R²", fontsize=11)
@@ -654,8 +509,8 @@ def plot_phi_r2_scatter(splits: dict,
     ax.tick_params(labelsize=9)
 
     fig.text(0.5, -0.06,
-             "Each point is one (K, λ_nonlin) configuration.  φ measures the fraction of "
-             "loading variance attributable to the nonlinear residual g(z).\n"
+             "Each point is one configuration. φ is a branch variance ratio, excluding "
+             "linear/nonlinear covariance; it is not a fraction of explained returns.\n"
              "Color indicates statistical significance of ResCAE vs IPCA (DM test).",
              ha="center", fontsize=8, style="italic")
 
@@ -665,7 +520,7 @@ def plot_phi_r2_scatter(splits: dict,
 
 def plot_ipca_drift(summary_df: pd.DataFrame,
                     figures_dir: str = "paper/figures") -> None:
-    """bar chart of relative W_skip drift from IPCA init per ResCAE config (figure 5). small drift validates φ interpretability."""
+    """bar chart of relative W_skip drift from IPCA init per ResCAE config (figure 5). Drift is a parameter diagnostic, not an identification test."""
     import os
     os.makedirs(figures_dir, exist_ok=True)
 
@@ -690,10 +545,9 @@ def plot_ipca_drift(summary_df: pd.DataFrame,
                label="100% drift  (‖Δ‖_F = ‖Γ_init‖_F)")
     ax.axhline(0.10, color="darkorange", lw=1.2, linestyle=":",
                label="Low drift threshold  (0.10)")
-    # shade the "IPCA initialization discarded" zone
+    # Relative parameter movement has no universal interpretation threshold.
     y_hi = max(max(drifts, default=1.2), 1.2) * 1.05
-    ax.axhspan(0.9, y_hi, color="firebrick", alpha=0.08,
-               label="IPCA initialization discarded  (drift > 0.9)")
+    ax.set_ylim(0, y_hi)
 
     ax.set_ylabel("‖W_skip − Γ_init‖_F / ‖Γ_init‖_F", fontsize=11)
     ax.set_title(
@@ -705,8 +559,8 @@ def plot_ipca_drift(summary_df: pd.DataFrame,
     ax.legend(fontsize=9)
 
     fig.text(0.5, -0.04,
-             "Small drift confirms the linear branch remains close to the IPCA solution,\n"
-             "validating the interpretability of the φ decomposition.",
+             "Drift measures movement in linear weights relative to their initial norm.\n"
+             "It does not identify a unique linear/nonlinear decomposition.",
              ha="center", fontsize=8, style="italic")
 
     plt.xticks(rotation=30, ha="right", fontsize=9)
@@ -714,18 +568,24 @@ def plot_ipca_drift(summary_df: pd.DataFrame,
     _save_fig(fig, os.path.join(figures_dir, "ipca_drift.png"))
 
 
-def get_portfolio_returns(r_true: np.ndarray, r_hat: np.ndarray) -> np.ndarray:
-    """monthly long-short decile portfolio return time series. params: {r_true: (T,N), r_hat: (T,N)}. returns (T,) array with NaN for months with fewer than 20 valid stocks."""
-    T = r_true.shape[0]
-    port = np.full(T, np.nan)
-    for t in range(T):
-        r_t = r_true[t]; rh = r_hat[t]
-        valid = _safe_mask(r_t, rh)
+def get_portfolio_returns(r_true, r_hat):
+    """Equal-weight top-minus-bottom predicted deciles; no portfolio for flat signals.
+
+    Percentile boundaries include ties, but legs must be disjoint. Each month
+    requires at least 20 observed stocks. Costs and financing are excluded.
+    """
+    port = np.full(len(r_true), np.nan)
+    if predictions_collapsed(r_true, r_hat):
+        return port
+    for t, (ret, pred) in enumerate(zip(r_true, r_hat)):
+        valid = _safe_mask(ret, pred)
         if valid.sum() < 20:
             continue
-        pv = rh[valid]; rv = r_t[valid]
-        q10 = np.percentile(pv, 10); q90 = np.percentile(pv, 90)
-        if not (pv >= q90).any() or not (pv <= q10).any():
+        pv, rv = pred[valid], ret[valid]
+        if pv.std() < 1e-6:
+            continue
+        q10, q90 = np.percentile(pv, [10, 90])
+        if q90 <= q10:
             continue
         port[t] = rv[pv >= q90].mean() - rv[pv <= q10].mean()
     return port
@@ -771,22 +631,26 @@ def diebold_mariano_test(errors_1: np.ndarray,
 
     if max_lag is None:
         max_lag = int(np.floor(4 * (T_eff / 100) ** (2 / 9)))
-    max_lag = max(max_lag, 0)
+    max_lag = min(max(int(max_lag), 0), T_eff - 1)
 
     d_dev   = d_clean - d_bar
     gamma0  = float((d_dev ** 2).mean())
     hac_var = gamma0
     for h in range(1, max_lag + 1):
-        gamma_h = float((d_dev[h:] * d_dev[:-h]).mean())
+        gamma_h = float((d_dev[h:] * d_dev[:-h]).sum() / T_eff)
         hac_var += 2.0 * (1.0 - h / (max_lag + 1)) * gamma_h
 
-    if hac_var <= 0:
+    if hac_var < 0:
         print(f"    WARNING: Newey-West variance non-positive ({hac_var:.2e}); "
               f"falling back to sample variance.")
         hac_var = gamma0
 
-    dm_stat = d_bar / np.sqrt(hac_var / T_eff)
-    p_value = 2.0 * (1.0 - float(_norm.cdf(abs(dm_stat))))
+    if hac_var == 0:
+        dm_stat = 0.0 if d_bar == 0 else np.nan
+        p_value = 1.0 if d_bar == 0 else np.nan
+    else:
+        dm_stat = d_bar / np.sqrt(hac_var / T_eff)
+        p_value = 2.0 * float(_norm.sf(abs(dm_stat)))
 
     return {
         "dm_stat":        float(dm_stat),
@@ -797,10 +661,19 @@ def diebold_mariano_test(errors_1: np.ndarray,
     }
 
 
+def _bootstrap_months(rng, n_months, block_length=6):
+    """Circular blocks preserve short-run monthly dependence."""
+    if n_months < 1 or block_length < 1:
+        raise ValueError("Bootstrap requires observations and a positive block length.")
+    starts = rng.integers(0, n_months, size=int(np.ceil(n_months / block_length)))
+    return ((starts[:, None] + np.arange(block_length)) % n_months).ravel()[:n_months]
+
+
 def bootstrap_r2_ci(r_true: np.ndarray,
                      r_hat: np.ndarray,
                      n_bootstrap: int = 1000,
                      seed: int = 42,
+                     block_length: int = 6,
                      ) -> dict:
     """bootstrap 95% CI for predictive R² by resampling the time dimension. params: {r_true: (T,N), r_hat: (T,N), n_bootstrap: int, seed: int}. returns dict with r2_observed, ci_lower, ci_upper, bootstrap_distribution."""
     T      = r_true.shape[0]
@@ -809,7 +682,7 @@ def bootstrap_r2_ci(r_true: np.ndarray,
     boot_r2 = np.full(n_bootstrap, np.nan)
 
     for b in range(n_bootstrap):
-        idx        = rng.integers(0, T, size=T)
+        idx        = _bootstrap_months(rng, T, block_length)
         boot_r2[b] = predictive_r2(r_true[idx], r_hat[idx])
 
     valid = boot_r2[np.isfinite(boot_r2)]
@@ -828,6 +701,7 @@ def bootstrap_sharpe_test(port_returns_1: np.ndarray,
                            port_returns_2: np.ndarray,
                            n_bootstrap: int = 1000,
                            seed: int = 42,
+                           block_length: int = 6,
                            ) -> dict:
     """bootstrap test for equality of Sharpe ratios. params: {port_returns_1: (T,), port_returns_2: (T,), n_bootstrap: int, seed: int}. returns dict with sharpe_1, sharpe_2, sharpe_diff, p_value, ci_lower, ci_upper, bootstrap_distribution.
 
@@ -852,7 +726,7 @@ def bootstrap_sharpe_test(port_returns_1: np.ndarray,
     nan_result = {"sharpe_1": np.nan, "sharpe_2": np.nan, "sharpe_diff": np.nan,
                   "p_value": np.nan, "ci_lower": np.nan, "ci_upper": np.nan,
                   "bootstrap_distribution": np.full(n_bootstrap, np.nan)}
-    if T == 0:
+    if T < 30:
         return nan_result
 
     sr1       = _sr(r1)
@@ -862,7 +736,7 @@ def bootstrap_sharpe_test(port_returns_1: np.ndarray,
     rng        = np.random.default_rng(seed)
     boot_delta = np.full(n_bootstrap, np.nan)
     for b in range(n_bootstrap):
-        idx           = rng.integers(0, T, size=T)
+        idx           = _bootstrap_months(rng, T, block_length)
         boot_delta[b] = _sr(r1[idx]) - _sr(r2[idx])
 
     bv = boot_delta[np.isfinite(boot_delta)]
@@ -871,7 +745,7 @@ def bootstrap_sharpe_test(port_returns_1: np.ndarray,
                 "sharpe_diff": delta_obs, "bootstrap_distribution": boot_delta}
 
     centered = bv - delta_obs
-    p_value  = float((np.abs(centered) >= np.abs(delta_obs)).mean())
+    p_value = float((1 + (np.abs(centered) >= np.abs(delta_obs)).sum()) / (len(bv) + 1))
 
     return {
         "sharpe_1":               sr1,
@@ -926,7 +800,7 @@ def plot_lambda_interaction(summary_df: pd.DataFrame,
 
 def phi_decomposition_analysis(summary_df: pd.DataFrame,
                                 figures_dir: str = "paper/figures") -> None:
-    """isolate parameter-count asymmetry from regularisation asymmetry in φ. diagonal configs (λ_lin==λ_nonlin) isolate parameter-count effects; skipped if fewer than 3 diagonal configs."""
+    """Describe φ under equal versus unequal penalty weights; this is not a controlled parameter-count experiment."""
     cae_df = summary_df[summary_df["Model"] == "ResCAE"].copy()
     if cae_df.empty:
         return
@@ -993,14 +867,7 @@ def run_significance_tests(splits: dict,
         scores_by_config = _hd.get("pred_val_mse") or _hd.get("val_losses", {})
 
     def _best_rescae_for_k(k: int):
-        k_cfgs = {key: sc for key, sc in scores_by_config.items()
-                  if key[0] == k and key in models["cae"]}
-        if k_cfgs:
-            return min(k_cfgs, key=k_cfgs.get)
-        for key in models["cae"]:
-            if key[0] == k:
-                return key
-        return None
+        return _best_key_per_k(models["cae"], hparam_path).get(k)
 
     # resolve per-K best ResCAE-Fixed
     fixed_hparam_path = os.path.join(results_dir, "cae_fixed_hparam_search.pkl")
@@ -1011,14 +878,7 @@ def run_significance_tests(splits: dict,
         fixed_scores = _fd.get("pred_val_mse") or _fd.get("val_losses", {})
 
     def _best_fixed_for_k(k: int):
-        k_cfgs = {key: sc for key, sc in fixed_scores.items()
-                  if key[0] == k and key in models.get("cae_fixed", {})}
-        if k_cfgs:
-            return min(k_cfgs, key=k_cfgs.get)
-        for key in models.get("cae_fixed", {}):
-            if key[0] == k:
-                return key
-        return None
+        return _best_key_per_k(models.get("cae_fixed", {}), fixed_hparam_path).get(k)
 
     def _pred(mtype: str, k: int, cae_key=None):
         if mtype == "pca":
@@ -1050,7 +910,12 @@ def run_significance_tests(splits: dict,
         return ""
 
     k_values = sorted(models["pca"].keys())
-    sig_results: dict = {}
+    test_dates = splits["test"]["returns"].index
+    sig_results: dict = {
+        "test_period": f"{test_dates[0]:%Y-%m} to {test_dates[-1]:%Y-%m} ({len(test_dates)} months)",
+        "bootstrap": {"method": "circular blocks", "block_length": 6, "samples": n_bootstrap},
+        "dm_convention": "positive favors first named model",
+    }
 
     # per-K comparisons
     for k in k_values:
@@ -1107,7 +972,9 @@ def run_significance_tests(splits: dict,
         sig_results[k] = entry
 
     # overall best ResCAE across all K
-    avail = {k: v for k, v in scores_by_config.items() if k in models["cae"]}
+    avail = {k: v for k, v in scores_by_config.items() if k in models["cae"] and np.isfinite(v)}
+    if not avail and len(models["cae"]) > 1:
+        raise ValueError("Validation scores are required to choose an overall ResCAE configuration.")
     overall_best = (min(avail, key=avail.get) if avail
                     else next(iter(models["cae"]), None))
     if overall_best is not None:
@@ -1211,12 +1078,12 @@ def run_significance_tests(splits: dict,
 
         if k in models["pca"]:
             _, err_pca = pca_pred_cache.get(k) or _pred("pca", k)
-            entry_vs["dm_pca_vs_cae_nl"] = diebold_mariano_test(err_pca, err_nl)
+            entry_vs["dm_pca_vs_cae_nl"] = diebold_mariano_test(err_nl, err_pca)
 
         rescae_key = _best_rescae_for_k(k)
         if rescae_key is not None:
             rh_rescae, err_rescae = _pred("rescae", k, rescae_key)
-            entry_vs["dm_rescae_vs_cae_nl"] = diebold_mariano_test(err_rescae, err_nl)
+            entry_vs["dm_rescae_vs_cae_nl"] = diebold_mariano_test(err_nl, err_rescae)
             entry_vs["boot_sharpe_rescae_vs_cae_nl"] = bootstrap_sharpe_test(
                 get_portfolio_returns(test_ret, rh_rescae),
                 get_portfolio_returns(test_ret, rh_nl),
@@ -1226,8 +1093,8 @@ def run_significance_tests(splits: dict,
     sig_results["vs_cae_nl"] = vs_cae_nl
 
     # print DM table (primary: ResCAE vs IPCA first)
-    print("\n--- Diebold-Mariano Results  (positive DM = right model better) ---")
-    print("  PRIMARY: ResCAE vs IPCA — does the nonlinear residual add value?")
+    print("\n--- Diebold-Mariano Results  (positive DM = first named model better) ---")
+    print("  PRIMARY: ResCAE vs IPCA — does the residual architecture improve forecasts?")
     hdr = f"{'Comparison':<26} {'K':>3} {'DM':>8} {'p':>8} {'sig':>4}"
     print(hdr)
     print("-" * len(hdr))
@@ -1257,7 +1124,7 @@ def run_significance_tests(splits: dict,
             print(f"{'ResCAE vs CAE-NL':<26} {k:>3} {dm:>8.3f} {p:>8.4f} {_sig(p):>4}")
 
     if have_fixed:
-        print("\n  FIXED PRIMARY: ResCAE-Fixed vs IPCA — frozen nonlinear residual add value?")
+        print("\n  FIXED PRIMARY: ResCAE-Fixed vs IPCA — does the frozen-linear architecture improve forecasts?")
         for k in k_values:
             if k not in sig_results:
                 continue
@@ -1319,6 +1186,19 @@ def run_significance_tests(splits: dict,
                 print(f"{lbl:<30} {k:>3} {r['sharpe_1']:>6.3f} {r['sharpe_2']:>6.3f} "
                       f"{r['sharpe_diff']:>7.3f} {p:>7.4f} {ci:>20} {_sig(p):>4}")
 
+    # Holm correction within each comparison across the prespecified K grid.
+    # All-grid per-config tests remain exploratory and unadjusted.
+    comparison_keys = {key for k in k_values for key in sig_results.get(k, {})
+                       if key.startswith("dm_")}
+    for comparison in comparison_keys:
+        entries = [sig_results[k][comparison] for k in k_values
+                   if comparison in sig_results.get(k, {})
+                   and np.isfinite(sig_results[k][comparison].get("p_value", np.nan))]
+        entries.sort(key=lambda entry: entry["p_value"])
+        adjusted = 0.0
+        for rank, entry in enumerate(entries):
+            adjusted = max(adjusted, min(1.0, (len(entries) - rank) * entry["p_value"]))
+            entry["p_value_holm"] = adjusted
     pkl_path = os.path.join(results_dir, "significance_tests.pkl")
     with open(pkl_path, "wb") as _f:
         pickle.dump(sig_results, _f)
@@ -1382,7 +1262,7 @@ def plot_significance_results(sig_results: dict,
         ax.axvline(0,      color="black",   lw=0.5)
         ax.set_yticks(y)
         ax.set_yticklabels(labels, fontsize=9)
-        ax.set_xlabel("DM statistic  (positive = right model better)", fontsize=11)
+        ax.set_xlabel("DM statistic  (positive = first named model better)", fontsize=11)
         ax.set_title("Diebold-Mariano Tests: Does the Nonlinear Residual Add Value?",
                      fontsize=13)
         ax.tick_params(labelsize=9)
@@ -1474,11 +1354,8 @@ def plot_residual_improvement(splits: dict,
         print("  No sig_results for residual improvement plot; skipping.")
         return
 
-    best_k, best_r2 = None, -np.inf
-    for k in k_values:
-        r2 = sig_results[k].get("boot_r2_rescae", {}).get("r2_observed", -np.inf)
-        if np.isfinite(r2) and r2 > best_r2:
-            best_r2, best_k = r2, k
+    best_key = sig_results.get("overall", {}).get("rescae_key")
+    best_k = best_key[0] if best_key is not None else None
 
     if best_k is None:
         print("  No valid ResCAE R² for residual improvement plot; skipping.")
@@ -1509,13 +1386,16 @@ def plot_residual_improvement(splits: dict,
 
     for i, (lo, hi, obs) in enumerate(zip(r2_lo, r2_hi, r2_obs)):
         if np.isfinite(lo) and np.isfinite(hi):
-            ax.errorbar(i, obs, yerr=[[obs - lo], [hi - obs]],
-                        fmt="none", color="black", capsize=4, lw=1.2)
+            # Percentile intervals need not contain the point estimate.
+            ax.plot([i, i], [lo, hi], color="black", lw=1.2)
+            ax.plot([i - 0.05, i + 0.05], [lo, lo], color="black", lw=1.2)
+            ax.plot([i - 0.05, i + 0.05], [hi, hi], color="black", lw=1.2)
 
     # significance brackets
     hi_finite = [h for h in r2_hi if np.isfinite(h)]
-    y_top     = (max(hi_finite) if hi_finite else max(r2_obs)) * 1.08
-    brk_h     = max(r2_obs) * 0.04
+    span = max(np.ptp(r2_obs), 0.001)
+    y_top = (max(hi_finite) if hi_finite else max(r2_obs)) + span * 0.08
+    brk_h = span * 0.04
 
     def _bracket(x1, x2, y, p_val):
         sig_str = f"p={p_val:.3f}" if np.isfinite(p_val) else "N/A"
@@ -1550,100 +1430,36 @@ def plot_residual_improvement(splits: dict,
     _save_fig(fig, os.path.join(figures_dir, "residual_improvement.png"))
 
 
-def format_paper_story(summary_df: pd.DataFrame, sig_results: dict) -> str:
-    """format the paper's central narrative as a terminal block. uses the K with the highest ResCAE Pred_R² as the representative config."""
-    rescae_rows = summary_df[summary_df["Model"] == "ResCAE"].copy()
-    rescae_rows["_pr2"] = pd.to_numeric(rescae_rows["Pred_R2"], errors="coerce")
-    if rescae_rows.empty or rescae_rows["_pr2"].isna().all():
-        return "[No ResCAE results available]"
-
-    best_k = int(rescae_rows.loc[rescae_rows["_pr2"].idxmax(), "K"])
-
-    def _row(model):
-        r = summary_df[(summary_df["Model"] == model) & (summary_df["K"] == best_k)]
-        return r.iloc[0] if not r.empty else None
-
-    pca_row    = _row("PCA")
-    ipca_row   = _row("IPCA")
-    fixed_row  = _row("ResCAE-Fixed")
-    rescae_row = _row("ResCAE")
-    nl_row     = _row("CAE-NL (robustness)")
-    sig_k      = sig_results.get(best_k, {})
-
-    def _fv(val, fmt=".4f"):
-        try:    return format(float(val), fmt)
-        except: return "N/A"
-
-    def _dm(key, src=None):
-        r = (src or sig_k).get(key, {})
-        return _fv(r.get("dm_stat"), ".3f"), _fv(r.get("p_value"), ".4f")
-
-    lines = ["=" * 66, "RESULTS — Test Set 2020–2024", "=" * 66, ""]
-
-    lines.append(f"Step 1: Do characteristics matter?  (PCA → IPCA)  [K={best_k}]")
-    if pca_row is not None:
-        lines.append(f"  PCA    Pred R²: {pca_row['Pred_R2']}   Sharpe: {pca_row['Sharpe']}")
-    if ipca_row is not None and pd.notna(ipca_row.get("Pred_R2")):
-        lines.append(f"  IPCA   Pred R²: {ipca_row['Pred_R2']}   Sharpe: {ipca_row['Sharpe']}")
-    else:
-        lines.append("  IPCA   [not yet trained]")
-    dm_stat, p_val = _dm("dm_ipca_vs_pca")
-    lines.append(f"  DM test (IPCA vs PCA):              stat={dm_stat},  p={p_val}")
-    lines.append("")
-
-    lines.append(f"Step 2a: Frozen nonlinear residual add value?  (IPCA → ResCAE-Fixed)  [K={best_k}]")
-    if fixed_row is not None and pd.notna(fixed_row.get("Pred_R2")):
-        phi_f = fixed_row.get("NL_frac", "N/A")
-        lines.append(f"  ResCAE-Fixed  Pred R²: {fixed_row['Pred_R2']}   "
-                     f"Sharpe: {fixed_row['Sharpe']}   φ={phi_f}  (W_skip=Γ_IPCA frozen)")
-    else:
-        lines.append("  ResCAE-Fixed  [not trained]")
-    dm_stat, p_val = _dm("dm_rescae_fixed_vs_ipca")
-    lines.append(f"  DM test (ResCAE-Fixed vs IPCA):     stat={dm_stat},  p={p_val}  "
-                 f"← PRIMARY-FIXED RESULT")
-    lines.append("")
-
-    lines.append(f"Step 2b: Does relaxing W_skip add more?  (ResCAE-Fixed → ResCAE)  [K={best_k}]")
-    if rescae_row is not None:
-        phi   = rescae_row.get("NL_frac",  "N/A")
-        drift = rescae_row.get("drift_rel", "N/A")
-        lines.append(f"  ResCAE  Pred R²: {rescae_row['Pred_R2']}   "
-                     f"Sharpe: {rescae_row['Sharpe']}   φ={phi}")
-    dm_stat, p_val = _dm("dm_rescae_vs_ipca")
-    lines.append(f"  DM test (ResCAE vs IPCA):           stat={dm_stat},  p={p_val}  "
-                 f"← PRIMARY RESULT")
-    dm_stat_sec, p_val_sec = _dm("dm_rescae_vs_rescae_fixed")
-    lines.append(f"  DM test (ResCAE vs ResCAE-Fixed):   stat={dm_stat_sec},  p={p_val_sec}  "
-                 f"← SECONDARY RESULT")
-    if rescae_row is not None:
-        lines.append(f"  W_skip drift from IPCA init: {drift}")
-    lines.append("")
-
-    lines.append("Robustness: ResCAE vs CAE-NL (no IPCA init, no linear branch)")
-    if nl_row is not None and pd.notna(nl_row.get("Pred_R2")):
-        nl_sharpe_raw = nl_row.get("Sharpe", "N/A")
-        try:
-            nl_sharpe_v = float(nl_sharpe_raw)
-            nl_sharpe_str = ("COLLAPSED (flat predictions — validates IPCA initialization)"
-                             if (np.isnan(nl_sharpe_v) or nl_sharpe_v == 0.0)
-                             else f"{nl_sharpe_v:.4f}")
-        except (TypeError, ValueError):
-            nl_sharpe_str = (nl_sharpe_raw if nl_sharpe_raw != "COLLAPSED"
-                             else "COLLAPSED (flat predictions — validates IPCA initialization)")
-        lines.append(f"  CAE-NL Pred R²: {nl_row['Pred_R2']}   Sharpe: {nl_sharpe_str}")
-    vs_nl   = sig_results.get("vs_cae_nl", {}).get(best_k, {})
-    r_vs_nl = vs_nl.get("dm_rescae_vs_cae_nl", {})
-    dm_stat = _fv(r_vs_nl.get("dm_stat"), ".3f")
-    p_val   = _fv(r_vs_nl.get("p_value"), ".4f")
-    lines.append(f"  DM test (ResCAE vs CAE-NL):         stat={dm_stat},  p={p_val}")
-    lines.append("=" * 66)
-
+def format_paper_story(summary_df, sig_results):
+    """Report the validation-selected model, without picking K on the test set."""
+    best = sig_results.get("overall", {}).get("rescae_key")
+    if best is None:
+        return "No validation-selected ResCAE configuration available. See the per-K summary."
+    k = best[0]
+    rows = summary_df[summary_df["K"] == k]
+    period = sig_results.get("test_period", "held-out period")
+    lines = [f"RESULTS — {period}", f"Representative ResCAE chosen on validation data: {best}",
+             rows[["Model", "K", "Pred_R2", "Sharpe", "NL_frac", "drift_rel"]].to_string(index=False),
+             "", "DM tests: positive statistic favors the first named model; two-sided p-values."]
+    for label, key in [("ResCAE vs IPCA", "dm_rescae_vs_ipca"),
+                       ("ResCAE vs PCA", "dm_rescae_vs_pca"),
+                       ("ResCAE-Fixed vs IPCA", "dm_rescae_fixed_vs_ipca"),
+                       ("ResCAE vs ResCAE-Fixed", "dm_rescae_vs_rescae_fixed")]:
+        result = sig_results.get(k, {}).get(key, {})
+        lines.append(f"  {label}: DM={result.get('dm_stat', np.nan):.3f}, "
+                     f"p={result.get('p_value', np.nan):.4f}, "
+                     f"Holm p across K={result.get('p_value_holm', np.nan):.4f}")
+    lines.extend(["", "Predictive R² and portfolio Sharpe measure different objectives.",
+                  "ResCAE-Fixed freezes W_skip; its encoder and nonlinear branch both train.",
+                  "The comparison does not isolate nonlinearity with fixed factors.",
+                  "φ is a branch variance ratio excluding covariance; it is not explained return variance.",
+                  "Flat predictions provide no stock ranking; this does not validate an architecture."])
     return "\n".join(lines)
 
 
 def plot_seed_stability(stability_df: pd.DataFrame,
                         figures_dir: str = "paper/figures") -> None:
-    """four-panel boxplot of φ, drift, Pred R², and Sharpe across seeds. best config (highest mean Pred R²) highlighted in seagreen."""
+    """Four-panel distribution of test metrics across seeds at validation-selected configurations."""
     import os
     os.makedirs(figures_dir, exist_ok=True)
 
@@ -1652,12 +1468,13 @@ def plot_seed_stability(stability_df: pd.DataFrame,
         return
 
     df = stability_df.copy()
+    if "selected_by_validation" in df:
+        df = df[df["selected_by_validation"]].copy()
     df["label"] = df.apply(
-        lambda r: f"K={int(r.K)} λL={r.lam_lin:.0e} λNL={r.lam_nonlin:.0e}",
+        lambda r: f"{r.get('Model', 'ResCAE')} K={int(r.K)}",
         axis=1)
 
-    mean_r2 = df.groupby("config_key")["pred_r2"].mean()
-    best_cfg = mean_r2.idxmax() if not mean_r2.empty else None
+    best_cfg = None
 
     metrics = [
         ("phi",     "φ  (Nonlinear Fraction)"),
@@ -1696,55 +1513,21 @@ def plot_seed_stability(stability_df: pd.DataFrame,
 
     fig.suptitle(
         f"Metric Distributions across {df['seed'].nunique()} Seeds  "
-        f"(seagreen = best config by mean Pred R²)",
+        f"(validation-selected configurations)",
         fontsize=13)
     fig.tight_layout()
     _save_fig(fig, os.path.join(figures_dir, "seed_stability.png"))
 
 
-def print_stability_summary(stability_df: pd.DataFrame) -> str:
-    """return mean ± std table for the best config per K (by mean Pred R²)."""
+def print_stability_summary(stability_df):
+    """Summarize seed variation within each validation-selected configuration."""
     if stability_df.empty:
-        return "[No seed stability data available]"
-
-    df = stability_df.copy()
-    best_per_k: dict = {}
-    for k in sorted(df["K"].unique()):
-        sub = df[df["K"] == k]
-        mean_r2 = sub.groupby("config_key")["pred_r2"].mean()
-        if not mean_r2.empty:
-            best_per_k[int(k)] = mean_r2.idxmax()
-
-    col_w = 18
-    header = (f"{'Config':<14} "
-              + "  ".join(f"{'Pred R²':<{col_w}} {'Sharpe':<{col_w}} "
-                           f"{'φ':<{col_w}} {'Drift':<{col_w}}".split()))
-    sep    = "─" * (14 + 4 * (col_w + 2))
-
-    lines = ["\n--- Seed Stability (best config per K, mean ± std) ---",
-             sep,
-             f"{'Config':<14}  {'Pred R²':<{col_w}}  {'Sharpe':<{col_w}}"
-             f"  {'φ':<{col_w}}  {'Drift':<{col_w}}",
-             sep]
-
-    for k, cfg_key in best_per_k.items():
-        sub = df[df["config_key"] == cfg_key]
-        row = df[df["config_key"] == cfg_key].iloc[0]
-        label = f"K={k} best"
-
-        def _ms(col):
-            vals = sub[col].dropna()
-            if vals.empty:
-                return "N/A"
-            return f"{vals.mean():.4f} ± {vals.std():.4f}"
-
-        lines.append(
-            f"{label:<14}  {_ms('pred_r2'):<{col_w}}  {_ms('sharpe'):<{col_w}}"
-            f"  {_ms('phi'):<{col_w}}  {_ms('drift'):<{col_w}}"
-        )
-
-    lines.append(sep)
-    return "\n".join(lines)
+        return "No multi-seed stability results available."
+    if "selected_by_validation" not in stability_df:
+        return "Legacy stability file has no validation selection markers; see the historical audit."
+    selected = stability_df[stability_df["selected_by_validation"]]
+    table = selected.groupby(["Model", "K"])[["pred_r2", "sharpe", "phi", "drift"]].agg(["mean", "std"])
+    return "Seed stability at validation-selected configurations (test metrics):\n" + table.to_string()
 
 
 def plot_fixed_vs_free_comparison(splits: dict,
@@ -1783,7 +1566,7 @@ def plot_fixed_vs_free_comparison(splits: dict,
 
         # match to same (K, lam_nonlin) free ResCAE
         k_free_cfgs = {key: free_scores.get(key, float("inf"))
-                       for key in cae_free if key[0] == k_f}
+                       for key in cae_free if key[0] == k_f and key[-1] == lam_nl_f}
         if not k_free_cfgs:
             continue
         free_key  = min(k_free_cfgs, key=k_free_cfgs.get)
@@ -1842,109 +1625,48 @@ def plot_fixed_vs_free_comparison(splits: dict,
     _save_fig(fig, os.path.join(figures_dir, "fixed_vs_free_comparison.png"))
 
 
-def run_evaluation(splits: dict,
-                   models: dict,
-                   figures_dir: str = "paper/figures",
-                   results_dir: str = "results",
-                   stability_df: Optional[pd.DataFrame] = None,
-                   ) -> Tuple[pd.DataFrame, dict]:
-    """end-to-end evaluation: metrics, figures, summary table. params: {splits, models, figures_dir, results_dir, stability_df}. returns (summary_df, sig_results)."""
+def run_evaluation(splits, models, figures_dir="paper/figures", results_dir="results",
+                   stability_df=None, n_bootstrap=1000):
+    """Evaluate and save numeric summaries, all-grid diagnostics, and figures."""
     import os
-    print("\n=== Evaluation ===")
-
-    summary_df = build_summary_table(splits, models, results_dir=results_dir)
-
-    sig_results = run_significance_tests(splits, models, figures_dir=figures_dir,
-                                         results_dir=results_dir)
-    plot_significance_results(sig_results, figures_dir=figures_dir)
-
-    # attach DM p-values to ResCAE/ResCAE-Fixed rows; others get "-"
-    summary_df["p_dm_vs_pca"]    = None
-    summary_df["p_dm_vs_ipca"]   = None
-    summary_df["p_dm_vs_cae_nl"] = None
-
-    for (k, lam_lin, lam_nonlin), pc_res in sig_results.get("per_config", {}).items():
-        mask = ((summary_df["Model"] == "ResCAE") &
-                (summary_df["K"] == k) &
-                (summary_df["λ_lin"]    == f"{lam_lin:.0e}") &
-                (summary_df["λ_nonlin"] == f"{lam_nonlin:.0e}"))
-        summary_df.loc[mask, "p_dm_vs_pca"]  = pc_res["dm_vs_pca"].get("p_value")
-        if "dm_vs_ipca" in pc_res:
-            summary_df.loc[mask, "p_dm_vs_ipca"] = pc_res["dm_vs_ipca"].get("p_value")
-
-    for (k, lam_nonlin), pc_res in sig_results.get("per_config_fixed", {}).items():
-        mask = ((summary_df["Model"] == "ResCAE-Fixed") &
-                (summary_df["K"] == k) &
-                (summary_df["λ_nonlin"] == f"{lam_nonlin:.0e}"))
-        summary_df.loc[mask, "p_dm_vs_pca"]  = pc_res["dm_vs_pca"].get("p_value")
-        if "dm_vs_ipca" in pc_res:
-            summary_df.loc[mask, "p_dm_vs_ipca"] = pc_res["dm_vs_ipca"].get("p_value")
-
-    for k, entry in sig_results.get("vs_cae_nl", {}).items():
-        if "dm_rescae_vs_cae_nl" not in entry:
-            continue
-        mask = (summary_df["Model"] == "ResCAE") & (summary_df["K"] == k)
-        summary_df.loc[mask, "p_dm_vs_cae_nl"] = (
-            entry["dm_rescae_vs_cae_nl"].get("p_value"))
-
-    non_sig = ~summary_df["Model"].isin(["ResCAE", "ResCAE-Fixed"])
-    for col in ["p_dm_vs_pca", "p_dm_vs_ipca", "p_dm_vs_cae_nl"]:
-        summary_df.loc[non_sig, col] = "-"
-
-    os.makedirs(figures_dir, exist_ok=True)
-
-    plot_residual_improvement(splits, models, sig_results, figures_dir=figures_dir)
-    plot_factor_portfolios(splits, models, figures_dir=figures_dir,
-                           results_dir=results_dir)
-    plot_phi_r2_scatter(splits, models, sig_results, figures_dir=figures_dir)
-    plot_fixed_vs_free_comparison(splits, models, figures_dir=figures_dir,
-                                  results_dir=results_dir)
-    plot_loss_curves(results_dir=results_dir, figures_dir=figures_dir)
-    plot_summary_heatmap(summary_df, figures_dir=figures_dir)
-    plot_ipca_drift(summary_df, figures_dir=figures_dir)
-    plot_lambda_interaction(summary_df, figures_dir=figures_dir)
-    phi_decomposition_analysis(summary_df, figures_dir=figures_dir)
-
-    if stability_df is not None and not stability_df.empty:
-        plot_seed_stability(stability_df, figures_dir=figures_dir)
-        print(print_stability_summary(stability_df))
-
-    csv_path = os.path.join(results_dir, "summary_table.csv")
     os.makedirs(results_dir, exist_ok=True)
-    summary_df.to_csv(csv_path, index=False)
-    print(f"\n  Summary table → {csv_path}")
-    print(f"  Figures saved to: {figures_dir}/")
-
-    # sanity checks for known failure modes
-    print("\n=== BUG FIX VALIDATION ===")
-    cae_nl_rows = summary_df[summary_df["Model"] == "CAE-NL (robustness)"]
-    bad_sharpe = cae_nl_rows[cae_nl_rows["Sharpe"] == "0.0000"]
-    if len(bad_sharpe) > 0:
-        print(f"  WARNING: {len(bad_sharpe)} CAE-NL rows still show Sharpe=0.0000 "
-              f"(should show COLLAPSED or NaN)")
-    else:
-        print("  Bug 1 confirmed: no CAE-NL rows show Sharpe=0.0000")
-
-    bad_phi = cae_nl_rows[cae_nl_rows["NL_frac"] == "1.000"]
-    if len(bad_phi) > 0:
-        print(f"  WARNING: {len(bad_phi)} CAE-NL rows still show NL_frac=1.000")
-    else:
-        print("  Bug 2 confirmed: no collapsed CAE-NL rows show NL_frac=1.000")
-
-    pca_rows = summary_df[summary_df["Model"] == "PCA"]
-    pca_r2_unique = pca_rows["Pred_R2"].nunique()
-    if pca_r2_unique == 1:
-        print("  WARNING: PCA Pred R² is identical for all K — investigate Bug 3")
-    else:
-        print(f"  Bug 3 confirmed: PCA Pred R² has {pca_r2_unique} unique values across K")
-
-    rescae_rows = summary_df[summary_df["Model"] == "ResCAE"]
-    high_drift = rescae_rows[
-        rescae_rows["drift_rel"].astype(str).str.contains(r"\*", na=False)]
-    if len(high_drift) > 0:
-        print(f"  Bug 5: {len(high_drift)} ResCAE configs have drift > 1.0 (capped+flagged with *)")
-    else:
-        print("  Bug 5: no drift > 1.0 found")
-    print("=== END VALIDATION ===\n")
-
-    return summary_df, sig_results
+    os.makedirs(figures_dir, exist_ok=True)
+    splits = evaluation_splits(splits)
+    print("\n=== Evaluation on the common characteristic-complete test panel ===")
+    all_metrics = build_summary_table(splits, models, results_dir, all_configs=True)
+    summary = all_metrics[all_metrics["selected_by_validation"]].copy()
+    sig = run_significance_tests(splits, models, figures_dir=figures_dir,
+                                 results_dir=results_dir, n_bootstrap=n_bootstrap)
+    for column in ("p_dm_vs_pca", "p_dm_vs_ipca", "p_dm_vs_cae_nl", "p_dm_vs_ipca_holm"):
+        summary[column] = np.nan
+    for idx, row in summary.iterrows():
+        k = int(row["K"])
+        prefix = {"ResCAE": "rescae", "ResCAE-Fixed": "rescae_fixed"}.get(row["Model"])
+        if prefix is None:
+            continue
+        for baseline in ("pca", "ipca"):
+            result = sig.get(k, {}).get(f"dm_{prefix}_vs_{baseline}", {})
+            summary.loc[idx, f"p_dm_vs_{baseline}"] = result.get("p_value", np.nan)
+            if baseline == "ipca":
+                summary.loc[idx, "p_dm_vs_ipca_holm"] = result.get("p_value_holm", np.nan)
+        if prefix == "rescae":
+            summary.loc[idx, "p_dm_vs_cae_nl"] = sig.get("vs_cae_nl", {}).get(k, {}).get(
+                "dm_rescae_vs_cae_nl", {}).get("p_value", np.nan)
+    # Save tabular evidence before plotting, so a plotting failure cannot lose results.
+    summary.to_csv(os.path.join(results_dir, "summary_table.csv"), index=False)
+    all_metrics.to_csv(os.path.join(results_dir, "all_config_metrics.csv"), index=False)
+    plot_significance_results(sig, figures_dir)
+    plot_residual_improvement(splits, models, sig, figures_dir)
+    plot_factor_portfolios(splits, models, figures_dir, results_dir)
+    plot_phi_r2_scatter(splits, models, sig, figures_dir)
+    plot_fixed_vs_free_comparison(splits, models, figures_dir, results_dir)
+    plot_loss_curves(results_dir, figures_dir)
+    plot_summary_heatmap(summary, figures_dir)
+    plot_ipca_drift(summary, figures_dir)
+    plot_lambda_interaction(all_metrics, figures_dir)
+    phi_decomposition_analysis(all_metrics, figures_dir)
+    if stability_df is not None and not stability_df.empty:
+        plot_seed_stability(stability_df, figures_dir)
+        print(print_stability_summary(stability_df))
+    print(f"\nSummary: {results_dir}/summary_table.csv")
+    return summary, sig

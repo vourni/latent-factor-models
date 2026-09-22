@@ -24,7 +24,7 @@ PATIENCE      = 25       # early stopping patience in epochs
 K_GRID             = [2,3,5,8,10]
 LAMBDA_LIN_GRID    = [1e-03, 5e-03, 1e-02, 5e-02, 1e-01]   # L1 on W_skip (linear branch)
 LAMBDA_NONLIN_GRID = [1e-06, 1e-05, 5e-05, 1e-04, 5e-04]   # L1 on g (nonlinear branch)
-LAMBDA_ORTH   = 1e-3     # weight on F'F/T = I_K penalty; resolves rotational indeterminacy
+LAMBDA_ORTH   = 1e-3     # scale/orthogonality penalty; rotations remain unidentified
 SEEDS         = [10, 30, 45, 99, 2048]   # S=5 seeds for multi-run experiments
 
 
@@ -151,6 +151,8 @@ def train_autoencoder(splits: dict,
 
     # restore best weights before returning
     net.load_state_dict(best_state)
+    model.train_losses = train_losses
+    model.val_losses = val_losses
 
     return model
 
@@ -181,7 +183,7 @@ def _run_cae_epoch(model: CAEModel,
 
     np.random.shuffle(t_indices) if train else None
     total_loss = 0.0
-    n_batches  = 0
+    n_observations = 0
 
     for start in range(0, len(t_indices), BATCH_SIZE):
         batch_t = t_indices[start : start + BATCH_SIZE]
@@ -202,10 +204,11 @@ def _run_cae_epoch(model: CAEModel,
             torch.nn.utils.clip_grad_norm_(model.net.parameters(), max_norm=1.0)
             optimizer.step()
 
-        total_loss += loss.item()
-        n_batches  += 1
+        count = int(mask.sum().item())
+        total_loss += loss.item() * count
+        n_observations += count
 
-    return total_loss / max(n_batches, 1)
+    return total_loss / n_observations if n_observations else float("inf")
 
 
 def train_cae_single(splits: dict,
@@ -215,6 +218,7 @@ def train_cae_single(splits: dict,
                      use_linear: bool = True,
                      freeze_linear: bool = False,
                      device: str = "cpu",
+                     ipca: Optional[IPCAModel] = None,
                      ) -> CAEModel:
     """train one CAE config (K, λ_lin, λ_nonlin) with early stopping; returns best-checkpoint CAEModel.
     use_linear=False omits W_skip (NL-only ablation); freeze_linear=True freezes W_skip after IPCA init."""
@@ -232,13 +236,15 @@ def train_cae_single(splits: dict,
                      device=device)
     model.fit()
     if use_linear:
-        model.initialize_from_ipca(train_ret, train_chars)
+        model.initialize_from_ipca(train_ret, train_chars, ipca=ipca)
     optimizer = Adam(model.net.parameters(), lr=LR)
 
     T_train = train_ret.shape[0]
     T_val   = val_ret.shape[0]
-    t_train = np.arange(T_train)
-    t_val   = np.arange(T_val)
+    t_train = np.flatnonzero((np.isfinite(train_ret) & np.isfinite(train_chars).all(axis=2).T).any(axis=1))
+    t_val = np.flatnonzero((np.isfinite(val_ret) & np.isfinite(val_chars).all(axis=2).T).any(axis=1))
+    if len(t_train) == 0 or len(t_val) == 0:
+        raise ValueError("CAE training and validation each need characteristic-complete observations.")
 
     best_val_loss  = float("inf")
     best_state     = None
@@ -282,11 +288,15 @@ def train_cae_single(splits: dict,
             print(f"    Early stop at epoch {epoch+1}  best_val={best_val_loss:.6f}")
             break
 
+    if best_state is None:
+        raise RuntimeError("Training produced no finite validation checkpoint.")
     model.net.load_state_dict(best_state)
+    model.train_losses = train_losses
+    model.val_losses = val_losses
 
     # diagnostic: near-zero mean factor signals the model will predict ~0 for all stocks
     if not use_linear:
-        mf = model.get_factors(train_ret, train_chars).mean(axis=0)
+        mf = np.nanmean(model.get_factors(train_ret, train_chars), axis=0)
         mf_norm = float(np.linalg.norm(mf))
         print(f"    [CAE-NL K={k}] post-training ‖f̄_train‖ = {mf_norm:.4f}"
               + (" ← NEAR ZERO: predict() will return ~0 for all stocks"
@@ -295,413 +305,125 @@ def train_cae_single(splits: dict,
     return model
 
 
-def train_all_cae(splits: dict,
-                  device: str = "cpu",
-                  run_dir: str = "results",
-                  ) -> Dict[Tuple[int, float, float], CAEModel]:
-    """grid search over (K, λ_lin, λ_nonlin) for the CAE; returns dict mapping (k, lam_lin, lam_nonlin) → CAEModel."""
-    results:      Dict[Tuple[int, float, float], CAEModel] = {}
-    val_losses:   Dict[Tuple[int, float, float], float]    = {}
-    pred_val_mse: Dict[Tuple[int, float, float], float]    = {}
-
-    train_ret   = splits["train"]["returns"].values.astype(np.float32)
-    train_chars = splits["train"]["chars"].astype(np.float32)
-
-    total = len(K_GRID) * len(LAMBDA_LIN_GRID) * len(LAMBDA_NONLIN_GRID)
-    config_num = 0
-
-    for k in K_GRID:
-        for lam_lin in LAMBDA_LIN_GRID:
-            for lam_nonlin in LAMBDA_NONLIN_GRID:
-                config_num += 1
-                print(f"\n  Training CAE K={k} λ_lin={lam_lin:.0e} "
-                      f"λ_nonlin={lam_nonlin:.0e} ({config_num}/{total}) …")
-                model = train_cae_single(splits, k, lam_lin, lam_nonlin, device)
-
-                # reconstruction validation loss
-                val_ret   = splits["val"]["returns"].values.astype(np.float32)
-                val_chars = splits["val"]["chars"].astype(np.float32)
-                T_val = val_ret.shape[0]
-                t_val = np.arange(T_val)
-                vl = _run_cae_epoch(model, val_ret, val_chars, t_val,
-                                    optimizer=None, train=False)
-
-                # OOS-safe predictive MSE: factor mean estimated from training period only
-                r_hat_val = model.predict(val_ret, val_chars,
-                                          train_returns=train_ret, train_chars=train_chars)
-                pmask    = np.isfinite(val_ret) & np.isfinite(r_hat_val)
-                pred_mse = (float(np.mean((val_ret[pmask] - r_hat_val[pmask]) ** 2))
-                            if pmask.any() else float("inf"))
-
-                results[(k, lam_lin, lam_nonlin)]      = model
-                val_losses[(k, lam_lin, lam_nonlin)]   = vl
-                pred_val_mse[(k, lam_lin, lam_nonlin)] = pred_mse
-
-    best_config = min(pred_val_mse, key=pred_val_mse.get)
-    print(f"\n  Best CAE config: K={best_config[0]}  "
-          f"λ_lin={best_config[1]:.0e}  λ_nonlin={best_config[2]:.0e}  "
-          f"pred_val_mse={pred_val_mse[best_config]:.6f}")
-
-    # save hyperparameter search results
-    summary_path = os.path.join(run_dir, "cae_hparam_search.pkl")
-    os.makedirs(run_dir, exist_ok=True)
-    with open(summary_path, "wb") as f:
-        pickle.dump({"val_losses": val_losses,
-                     "pred_val_mse": pred_val_mse,
-                     "best": best_config}, f)
-
-    return results
-
-
-def train_all_cae_nonlinear(splits: dict,
-                            device: str = "cpu",
-                            run_dir: str = "results",
-                            ) -> Dict[Tuple[int, float], CAEModel]:
-    """grid search over (K, λ_nonlin) for the NL-only CAE ablation (no W_skip); returns dict mapping (k, lam_nonlin) → CAEModel."""
-    results:      Dict[Tuple[int, float], CAEModel] = {}
-    val_losses:   Dict[Tuple[int, float], float]    = {}
-    pred_val_mse: Dict[Tuple[int, float], float]    = {}
-
-    train_ret   = splits["train"]["returns"].values.astype(np.float32)
-    train_chars = splits["train"]["chars"].astype(np.float32)
-
-    total = len(K_GRID) * len(LAMBDA_NONLIN_GRID)
-    config_num = 0
-
-    for k in K_GRID:
-        for lam_nonlin in LAMBDA_NONLIN_GRID:
-            config_num += 1
-            print(f"\n  Training CAE-NL K={k} λ_nonlin={lam_nonlin:.0e} "
-                  f"({config_num}/{total}) …")
-            model = train_cae_single(
-                splits, k,
-                lam_lin=0.0, lam_nonlin=lam_nonlin,
-                use_linear=False, device=device,
-            )
-
-            val_ret   = splits["val"]["returns"].values.astype(np.float32)
-            val_chars = splits["val"]["chars"].astype(np.float32)
-            T_val = val_ret.shape[0]
-            t_val = np.arange(T_val)
-            vl = _run_cae_epoch(model, val_ret, val_chars, t_val,
-                                optimizer=None, train=False)
-
-            # OOS-safe predictive MSE
-            r_hat_val = model.predict(val_ret, val_chars,
-                                      train_returns=train_ret, train_chars=train_chars)
-            pmask    = np.isfinite(val_ret) & np.isfinite(r_hat_val)
-            pred_mse = (float(np.mean((val_ret[pmask] - r_hat_val[pmask]) ** 2))
-                        if pmask.any() else float("inf"))
-
-            results[(k, lam_nonlin)]      = model
-            val_losses[(k, lam_nonlin)]   = vl
-            pred_val_mse[(k, lam_nonlin)] = pred_mse
-
-    best_config = min(pred_val_mse, key=pred_val_mse.get)
-    print(f"\n  Best CAE-NL config: K={best_config[0]}  "
-          f"λ_nonlin={best_config[1]:.0e}  "
-          f"pred_val_mse={pred_val_mse[best_config]:.6f}")
-
-    os.makedirs(run_dir, exist_ok=True)
-    summary_path = os.path.join(run_dir, "cae_nl_hparam_search.pkl")
-    with open(summary_path, "wb") as f:
-        pickle.dump({"val_losses": val_losses,
-                     "pred_val_mse": pred_val_mse,
-                     "best": best_config}, f)
-
-    return results
-
-
-# seed all RNGs then delegate to train_cae_single
-def train_cae_single_seeded(
-    splits: dict,
-    k: int,
-    lam_lin: float,
-    lam_nonlin: float,
-    seed: int,
-    use_linear: bool = True,
-    freeze_linear: bool = False,
-    device: str = "cpu",
-) -> CAEModel:
-    """train a single CAE with a fixed random seed. params: {splits: dict, k: int, lam_lin: float, lam_nonlin: float, seed: int, use_linear: bool, freeze_linear: bool, device: str}. returns CAEModel."""
+def train_cae_single_seeded(splits, k, lam_lin, lam_nonlin, seed,
+                            use_linear=True, freeze_linear=False, device="cpu", ipca=None):
+    """Train one configuration with an explicit random seed."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    return train_cae_single(splits, k, lam_lin, lam_nonlin,
-                            use_linear=use_linear, freeze_linear=freeze_linear,
-                            device=device)
+    model = train_cae_single(
+        splits, k, lam_lin, lam_nonlin, use_linear=use_linear,
+        freeze_linear=freeze_linear, device=device, ipca=ipca)
+    model.seed = seed
+    return model
 
 
-def train_all_cae_multiseed(
-    splits: dict,
-    seeds: List[int] = SEEDS,
-    device: str = "cpu",
-    run_dir: str = "results",
-) -> Dict[Tuple[int, float, float], List[CAEModel]]:
-    """run the full CAE grid search once per seed; selects best config by mean predictive val MSE.
-    saves per-seed details and a standard hparam pkl for downstream eval.
-    returns dict mapping (k, lam_lin, lam_nonlin) → List[CAEModel] of length S."""
-    all_models:   Dict[Tuple, List[CAEModel]] = {}
-    all_pred_mse: Dict[Tuple, List[float]]    = {}
+def _train_grid(splits, family, k_list, device, run_dir, ipca_models=None, seeds=None):
+    """Shared search/selection protocol for all three conditional model families.
 
-    train_ret   = splits["train"]["returns"].values.astype(np.float32)
+    Multi-seed selection uses mean individual-seed validation predictive MSE;
+    evaluation averages predictions. Test data never enter model selection.
+    """
+    models, scores, reconstruction_scores = {}, {}, {}
+    train_ret = splits["train"]["returns"].values.astype(np.float32)
     train_chars = splits["train"]["chars"].astype(np.float32)
-    val_ret     = splits["val"]["returns"].values.astype(np.float32)
-    val_chars   = splits["val"]["chars"].astype(np.float32)
+    val_ret = splits["val"]["returns"].values.astype(np.float32)
+    val_chars = splits["val"]["chars"].astype(np.float32)
+    linear_grid = LAMBDA_LIN_GRID if family == "cae" else [0.0]
+    run_seeds = list(seeds) if seeds is not None else [None]
+    if not run_seeds or len(run_seeds) != len(set(run_seeds)):
+        raise ValueError("Seeds must be nonempty and distinct.")
 
-    total_configs = len(K_GRID) * len(LAMBDA_LIN_GRID) * len(LAMBDA_NONLIN_GRID)
-    config_num = 0
-
-    for k in K_GRID:
-        for lam_lin in LAMBDA_LIN_GRID:
+    for k in k_list:
+        for lam_lin in linear_grid:
             for lam_nonlin in LAMBDA_NONLIN_GRID:
-                config_num += 1
-                key = (k, lam_lin, lam_nonlin)
-                all_models[key]   = []
-                all_pred_mse[key] = []
+                key = (k, lam_lin, lam_nonlin) if family == "cae" else (k, lam_nonlin)
+                fitted, pred_losses, rec_losses = [], [], []
+                for seed in run_seeds:
+                    print(f"\n  Training {family}: {key}, seed={seed}")
+                    kwargs = dict(use_linear=family != "cae_nl",
+                                  freeze_linear=family == "cae_fixed", device=device,
+                                  ipca=(ipca_models or {}).get(k))
+                    if seed is None:
+                        model = train_cae_single(splits, k, lam_lin, lam_nonlin, **kwargs)
+                    else:
+                        model = train_cae_single_seeded(
+                            splits, k, lam_lin, lam_nonlin, seed=seed, **kwargs)
+                    pred = model.predict(val_ret, val_chars, train_ret, train_chars)
+                    mask = np.isfinite(val_ret) & np.isfinite(pred)
+                    mse = float(np.mean((val_ret[mask] - pred[mask]) ** 2)) if mask.any() else np.inf
+                    if not np.isfinite(mse):
+                        raise RuntimeError(f"Nonfinite validation MSE for {family} {key}.")
+                    fitted.append(model)
+                    pred_losses.append(mse)
+                    rec_losses.append(min(model.val_losses))
+                    if family == "cae_fixed":
+                        np.testing.assert_array_equal(
+                            model.net.decoder.W_skip.weight.detach().cpu().numpy(), model.gamma_init)
+                models[key] = fitted if seeds is not None else fitted[0]
+                scores[key] = pred_losses
+                reconstruction_scores[key] = float(np.mean(rec_losses))
 
-                print(f"\n  Config {config_num}/{total_configs}: "
-                      f"K={k} λ_lin={lam_lin:.0e} λ_nonlin={lam_nonlin:.0e}")
-
-                for s_idx, seed in enumerate(seeds):
-                    print(f"    Seed {seed} ({s_idx+1}/{len(seeds)}) ...")
-                    model = train_cae_single_seeded(
-                        splits, k, lam_lin, lam_nonlin,
-                        seed=seed, use_linear=True, device=device,
-                    )
-                    r_hat_val = model.predict(val_ret, val_chars,
-                                              train_returns=train_ret,
-                                              train_chars=train_chars)
-                    pmask    = np.isfinite(val_ret) & np.isfinite(r_hat_val)
-                    pred_mse = (float(np.mean((val_ret[pmask] - r_hat_val[pmask]) ** 2))
-                                if pmask.any() else float("inf"))
-                    all_models[key].append(model)
-                    all_pred_mse[key].append(pred_mse)
-
-                mean_mse = float(np.mean(all_pred_mse[key]))
-                std_mse  = float(np.std(all_pred_mse[key]))
-                print(f"    Mean pred val MSE: {mean_mse:.6f} ± {std_mse:.6f}")
-
-    mean_mse_per_config = {k: float(np.mean(v)) for k, v in all_pred_mse.items()}
-    best_config = min(mean_mse_per_config, key=mean_mse_per_config.get)
-    print(f"\n  Best CAE config (by mean pred val MSE across {len(seeds)} seeds):")
-    print(f"  K={best_config[0]}  λ_lin={best_config[1]:.0e}  "
-          f"λ_nonlin={best_config[2]:.0e}  "
-          f"mean_pred_val_mse={mean_mse_per_config[best_config]:.6f}")
-
+    mean_scores = {key: float(np.mean(value)) for key, value in scores.items()}
+    best = min(mean_scores, key=mean_scores.get)
+    print(f"\n  Best {family} by validation predictive MSE: {best} ({mean_scores[best]:.6f})")
     os.makedirs(run_dir, exist_ok=True)
-    # full per-seed details
-    with open(os.path.join(run_dir, "cae_multiseed_hparam_search.pkl"), "wb") as f:
-        pickle.dump({"all_pred_mse": all_pred_mse,
-                     "mean_mse_per_config": mean_mse_per_config,
-                     "best": best_config, "seeds": seeds}, f)
-    # standard pkl with mean scores so evaluate.py can read it transparently
-    with open(os.path.join(run_dir, "cae_hparam_search.pkl"), "wb") as f:
-        pickle.dump({"val_losses":   mean_mse_per_config,
-                     "pred_val_mse": mean_mse_per_config,
-                     "best": best_config}, f)
-
-    return all_models
+    with open(os.path.join(run_dir, f"{family}_hparam_search.pkl"), "wb") as f:
+        pickle.dump({"val_losses": reconstruction_scores, "pred_val_mse": mean_scores,
+                     "best": best}, f)
+    if seeds is not None:
+        with open(os.path.join(run_dir, f"{family}_multiseed_hparam_search.pkl"), "wb") as f:
+            pickle.dump({"all_pred_mse": scores, "mean_mse_per_config": mean_scores,
+                         "best": best, "seeds": list(seeds)}, f)
+    return models
 
 
-def train_all_cae_nl_multiseed(
-    splits: dict,
-    seeds: List[int] = SEEDS,
-    device: str = "cpu",
-    run_dir: str = "results",
-) -> Dict[Tuple[int, float], List[CAEModel]]:
-    """run the CAE-NL grid search once per seed; saves per-seed and standard hparam pkls.
-    returns dict mapping (k, lam_nonlin) → List[CAEModel] of length S."""
-    all_models:   Dict[Tuple, List[CAEModel]] = {}
-    all_pred_mse: Dict[Tuple, List[float]]    = {}
-
-    train_ret   = splits["train"]["returns"].values.astype(np.float32)
-    train_chars = splits["train"]["chars"].astype(np.float32)
-    val_ret     = splits["val"]["returns"].values.astype(np.float32)
-    val_chars   = splits["val"]["chars"].astype(np.float32)
-
-    total_configs = len(K_GRID) * len(LAMBDA_NONLIN_GRID)
-    config_num = 0
-
-    for k in K_GRID:
-        for lam_nonlin in LAMBDA_NONLIN_GRID:
-            config_num += 1
-            key = (k, lam_nonlin)
-            all_models[key]   = []
-            all_pred_mse[key] = []
-
-            print(f"\n  Config {config_num}/{total_configs}: "
-                  f"K={k} λ_nonlin={lam_nonlin:.0e}")
-
-            for s_idx, seed in enumerate(seeds):
-                print(f"    Seed {seed} ({s_idx+1}/{len(seeds)}) ...")
-                model = train_cae_single_seeded(
-                    splits, k, 0.0, lam_nonlin,
-                    seed=seed, use_linear=False, device=device,
-                )
-                r_hat_val = model.predict(val_ret, val_chars,
-                                          train_returns=train_ret,
-                                          train_chars=train_chars)
-                pmask    = np.isfinite(val_ret) & np.isfinite(r_hat_val)
-                pred_mse = (float(np.mean((val_ret[pmask] - r_hat_val[pmask]) ** 2))
-                            if pmask.any() else float("inf"))
-                all_models[key].append(model)
-                all_pred_mse[key].append(pred_mse)
-
-            mean_mse = float(np.mean(all_pred_mse[key]))
-            std_mse  = float(np.std(all_pred_mse[key]))
-            print(f"    Mean pred val MSE: {mean_mse:.6f} ± {std_mse:.6f}")
-
-    mean_mse_per_config = {k: float(np.mean(v)) for k, v in all_pred_mse.items()}
-    best_config = min(mean_mse_per_config, key=mean_mse_per_config.get)
-    print(f"\n  Best CAE-NL config (by mean pred val MSE across {len(seeds)} seeds):")
-    print(f"  K={best_config[0]}  λ_nonlin={best_config[1]:.0e}  "
-          f"mean_pred_val_mse={mean_mse_per_config[best_config]:.6f}")
-
-    os.makedirs(run_dir, exist_ok=True)
-    with open(os.path.join(run_dir, "cae_nl_multiseed_hparam_search.pkl"), "wb") as f:
-        pickle.dump({"all_pred_mse": all_pred_mse,
-                     "mean_mse_per_config": mean_mse_per_config,
-                     "best": best_config, "seeds": seeds}, f)
-    with open(os.path.join(run_dir, "cae_nl_hparam_search.pkl"), "wb") as f:
-        pickle.dump({"val_losses":   mean_mse_per_config,
-                     "pred_val_mse": mean_mse_per_config,
-                     "best": best_config}, f)
-
-    return all_models
+def train_all_cae(splits, device="cpu", run_dir="results", k_list=None, ipca_models=None):
+    return _train_grid(splits, "cae", K_GRID if k_list is None else k_list,
+                       device, run_dir, ipca_models)
 
 
-# train ResCAE-Fixed: W_skip is frozen at its IPCA init; only g and encoder are updated
-def train_cae_fixed_single(
-    splits: dict,
-    k: int,
-    lam_nonlin: float,
-    device: str = "cpu",
-) -> CAEModel:
-    """train ResCAE-Fixed (frozen W_skip). params: {splits: dict, k: int, lam_nonlin: float, device: str}. returns CAEModel."""
-    return train_cae_single(
-        splits, k,
-        lam_lin=0.0,
-        lam_nonlin=lam_nonlin,
-        use_linear=True,
-        freeze_linear=True,
-        device=device,
-    )
+def train_all_cae_nonlinear(splits, device="cpu", run_dir="results", k_list=None):
+    return _train_grid(splits, "cae_nl", K_GRID if k_list is None else k_list, device, run_dir)
 
 
-def train_all_cae_fixed(
-    splits: dict,
-    device: str = "cpu",
-    run_dir: str = "results",
-) -> Dict[Tuple[int, float], CAEModel]:
-    """grid search over (K, λ_nonlin) for ResCAE-Fixed; selects best by predictive val MSE.
-    saves to results/cae_fixed_hparam_search.pkl. returns dict mapping (k, lam_nonlin) → CAEModel."""
-    results:      Dict[Tuple[int, float], CAEModel] = {}
-    val_losses:   Dict[Tuple[int, float], float]    = {}
-    pred_val_mse: Dict[Tuple[int, float], float]    = {}
-
-    train_ret   = splits["train"]["returns"].values.astype(np.float32)
-    train_chars = splits["train"]["chars"].astype(np.float32)
-
-    total      = len(K_GRID) * len(LAMBDA_NONLIN_GRID)
-    config_num = 0
-
-    for k in K_GRID:
-        for lam_nonlin in LAMBDA_NONLIN_GRID:
-            config_num += 1
-            print(f"\n  Training ResCAE-Fixed K={k} λ_nonlin={lam_nonlin:.0e} "
-                  f"({config_num}/{total}) …")
-            model = train_cae_fixed_single(splits, k, lam_nonlin, device)
-
-            val_ret   = splits["val"]["returns"].values.astype(np.float32)
-            val_chars = splits["val"]["chars"].astype(np.float32)
-            T_val     = val_ret.shape[0]
-            t_val     = np.arange(T_val)
-            vl = _run_cae_epoch(model, val_ret, val_chars, t_val,
-                                optimizer=None, train=False)
-
-            r_hat_val = model.predict(val_ret, val_chars,
-                                      train_returns=train_ret, train_chars=train_chars)
-            pmask    = np.isfinite(val_ret) & np.isfinite(r_hat_val)
-            pred_mse = (float(np.mean((val_ret[pmask] - r_hat_val[pmask]) ** 2))
-                        if pmask.any() else float("inf"))
-
-            results[(k, lam_nonlin)]      = model
-            val_losses[(k, lam_nonlin)]   = vl
-            pred_val_mse[(k, lam_nonlin)] = pred_mse
-
-    best_config = min(pred_val_mse, key=pred_val_mse.get)
-    print(f"\n  Best ResCAE-Fixed config: K={best_config[0]}  "
-          f"λ_nonlin={best_config[1]:.0e}  "
-          f"pred_val_mse={pred_val_mse[best_config]:.6f}")
-
-    # verify W_skip hasn't drifted from its IPCA init (should be zero drift)
-    for key, m in results.items():
-        if m.gamma_init is not None:
-            w_norm = np.linalg.norm(
-                m.net.decoder.W_skip.weight.detach().cpu().numpy(), "fro")
-            g_norm = np.linalg.norm(m.gamma_init, "fro")
-            if abs(w_norm - g_norm) > 1e-5:
-                print(f"  WARNING: ResCAE-Fixed {key}: "
-                      f"‖W_skip‖={w_norm:.6f} ≠ ‖Γ‖={g_norm:.6f} "
-                      f"(diff={abs(w_norm-g_norm):.2e}) — W_skip may have moved.")
-            assert m.compute_ipca_drift() == 0.0, \
-                f"Drift should be zero for ResCAE-Fixed but got {m.compute_ipca_drift()}"
-
-    os.makedirs(run_dir, exist_ok=True)
-    summary_path = os.path.join(run_dir, "cae_fixed_hparam_search.pkl")
-    with open(summary_path, "wb") as f:
-        pickle.dump({"val_losses":   val_losses,
-                     "pred_val_mse": pred_val_mse,
-                     "best":         best_config}, f)
-
-    return results
+def train_all_cae_multiseed(splits, seeds=SEEDS, device="cpu", run_dir="results",
+                           k_list=None, ipca_models=None):
+    return _train_grid(splits, "cae", K_GRID if k_list is None else k_list,
+                       device, run_dir, ipca_models, seeds)
 
 
-def train_all_models(splits: dict,
-                     k_list: List[int] = K_GRID,
-                     device: str = "cpu",
-                     multi_seed: bool = False,
-                     seeds: List[int] = SEEDS,
-                     run_dir: str = "results",
-                     ) -> dict:
-    """train all model families (PCA, IPCA, AE, CAE, CAE-NL, ResCAE-Fixed) for each K in k_list.
-    if multi_seed=True, CAE and CAE-NL are each trained S times and results are lists.
-    returns a dict keyed by model name with per-K or per-config sub-dicts."""
-    models: dict = {"pca": {}, "ipca": {}, "ae": {}, "cae": {}, "cae_nl": {},
-                    "cae_fixed": {}, "multi_seed": multi_seed}
+def train_all_cae_nl_multiseed(splits, seeds=SEEDS, device="cpu", run_dir="results", k_list=None):
+    return _train_grid(splits, "cae_nl", K_GRID if k_list is None else k_list,
+                       device, run_dir, seeds=seeds)
 
-    print("\n=== Training PCA ===")
+
+def train_cae_fixed_single(splits, k, lam_nonlin, device="cpu", ipca=None):
+    return train_cae_single(splits, k, 0.0, lam_nonlin, freeze_linear=True, device=device, ipca=ipca)
+
+
+def train_all_cae_fixed(splits, device="cpu", run_dir="results", k_list=None,
+                        ipca_models=None, seeds=None):
+    return _train_grid(splits, "cae_fixed", K_GRID if k_list is None else k_list,
+                       device, run_dir, ipca_models, seeds)
+
+
+def train_all_models(splits, k_list=None, device="cpu", multi_seed=False,
+                      seeds=SEEDS, run_dir="results"):
+    """Train all six families on the requested K grid; ensemble all CAE variants."""
+    k_list = K_GRID if k_list is None else list(k_list)
+    if not k_list or any(k <= 0 for k in k_list):
+        raise ValueError("Provide at least one positive factor dimension.")
+    models = {"pca": {}, "ipca": {}, "ae": {}, "multi_seed": multi_seed}
     for k in k_list:
         models["pca"][k] = train_pca(splits, k)
-
-    print("\n=== Training IPCA ===")
-    for k in k_list:
         models["ipca"][k] = train_ipca(splits, k)
-
-    print("\n=== Training Autoencoder ===")
-    for k in k_list:
-        print(f"\n  Training AE K={k} …")
         models["ae"][k] = train_autoencoder(splits, k, device)
-
     if multi_seed:
-        models["seeds"] = seeds
-
-        print(f"\n=== Training CAE ({len(seeds)} seeds × grid search) ===")
-        models["cae"] = train_all_cae_multiseed(splits, seeds, device, run_dir=run_dir)
-
-        print(f"\n=== Training CAE-NL ablation ({len(seeds)} seeds) ===")
-        models["cae_nl"] = train_all_cae_nl_multiseed(splits, seeds, device, run_dir=run_dir)
-    else:
-        print("\n=== Training CAE (grid search) ===")
-        models["cae"] = train_all_cae(splits, device, run_dir=run_dir)
-
-        print("\n=== Training CAE-NL ablation (no linear term) ===")
-        models["cae_nl"] = train_all_cae_nonlinear(splits, device, run_dir=run_dir)
-
-    # ResCAE-Fixed is always single-seed; W_skip is deterministically frozen at IPCA solution
-    print("\n=== Training ResCAE-Fixed (frozen W_skip) ===")
-    models["cae_fixed"] = train_all_cae_fixed(splits, device, run_dir=run_dir)
-
+        models["seeds"] = list(seeds)
+    for family in ("cae", "cae_nl", "cae_fixed"):
+        models[family] = _train_grid(splits, family, k_list, device, run_dir,
+                                     ipca_models=models["ipca"],
+                                     seeds=seeds if multi_seed else None)
     return models

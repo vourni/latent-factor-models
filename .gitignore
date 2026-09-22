@@ -3,3 +3,9 @@
 /.venv
 /.vscode
 /data
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+/results/*/models/
+/results/smoke-*/

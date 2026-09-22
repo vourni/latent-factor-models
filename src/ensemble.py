@@ -15,6 +15,8 @@ class EnsembledModel:
         assert len(models) > 0, "Need at least one model"
         self.models     = models
         self.n_seeds    = len(models)
+        self.use_linear = models[0].use_linear
+        self.freeze_linear = models[0].freeze_linear
         # surface attributes evaluate.py may inspect on a CAEModel
         self.gamma_init = getattr(models[0], "gamma_init", None)
         self.lam_lin    = getattr(models[0], "lam_lin",    0.0)
@@ -82,161 +84,65 @@ class EnsembledModel:
 
 def build_ensembles(models: dict) -> dict:
     """converts a multi-seed models dict into an ensembled models dict. PCA, IPCA, and AE pass through unchanged. params: {models: dict}. returns dict."""
-    ensembled = {k: v for k, v in models.items()
-                 if k not in ("cae", "cae_nl", "multi_seed", "seeds")}
-
-    ensembled["cae"] = {}
-    for key, model_list in models["cae"].items():
-        if isinstance(model_list, list):
-            ensembled["cae"][key] = EnsembledModel(model_list)
-        else:
-            ensembled["cae"][key] = model_list  # already a single model
-
-    ensembled["cae_nl"] = {}
-    for key, model_list in models.get("cae_nl", {}).items():
-        if isinstance(model_list, list):
-            ensembled["cae_nl"][key] = EnsembledModel(model_list)
-        else:
-            ensembled["cae_nl"][key] = model_list
-
+    ensembled = dict(models)
+    for family in ("cae", "cae_nl", "cae_fixed"):
+        ensembled[family] = {
+            key: EnsembledModel(value) if isinstance(value, list) else value
+            for key, value in models.get(family, {}).items()
+        }
     ensembled["multi_seed"] = False
     return ensembled
 
 
-def compute_seed_stability(splits: dict, models: dict,
-                           results_dir: str = "results") -> pd.DataFrame:
-    """computes per-seed pred R², Sharpe, φ, and drift for each CAE config. params: {splits: dict, models: dict, results_dir: str}. returns pd.DataFrame."""
-    from src.evaluate import (predictive_r2, factor_sharpe,
-                               nonlinear_contribution)
-
-    test_ret    = splits["test"]["returns"].values.astype(np.float32)
-    test_chars  = splits["test"]["chars"].astype(np.float32)
-    train_ret   = splits["train"]["returns"].values.astype(np.float32)
+def compute_seed_stability(splits, models, results_dir="results"):
+    """Per-seed test diagnostics with validation-selected configurations marked."""
+    from src.evaluate import (predictive_r2, factor_sharpe, nonlinear_contribution,
+                              compute_ipca_drift, _best_key_per_k, evaluation_splits,
+                              predictions_collapsed)
+    splits = evaluation_splits(splits)
+    test_ret = splits["test"]["returns"].values.astype(np.float32)
+    test_chars = splits["test"]["chars"].astype(np.float32)
+    train_ret = splits["train"]["returns"].values.astype(np.float32)
     train_chars = splits["train"]["chars"].astype(np.float32)
-
-    seeds = models.get("seeds", [])
-    rows  = []
-
-    for key, model_list in models.get("cae", {}).items():
-        if not isinstance(model_list, list):
-            continue   # single-seed run — no stability to report
-        k, lam_lin, lam_nonlin = key
-
-        for s_idx, model in enumerate(model_list):
-            seed = seeds[s_idx] if s_idx < len(seeds) else s_idx
-
-            r_hat = model.predict(test_ret, test_chars,
-                                  train_returns=train_ret,
-                                  train_chars=train_chars).astype(np.float32)
-
-            # drift from IPCA init
-            drift = None
-            if hasattr(model, "gamma_init") and model.gamma_init is not None:
-                w     = model.net.decoder.W_skip.weight.detach().cpu().numpy()
-                gamma = model.gamma_init
-                denom = np.linalg.norm(gamma, "fro")
-                if denom >= 1e-10:
-                    drift = float(np.linalg.norm(w - gamma, "fro") / denom)
-
-            _, _, phi = nonlinear_contribution(model, test_ret, test_chars)
-
-            rows.append({
-                "config_key": str(key),
-                "K":          k,
-                "lam_lin":    lam_lin,
-                "lam_nonlin": lam_nonlin,
-                "seed":       seed,
-                "pred_r2":    predictive_r2(test_ret, r_hat),
-                "sharpe":     factor_sharpe(test_ret, r_hat),
-                "phi":        phi,
-                "drift":      drift,
-            })
-
-    # ResCAE-Fixed is single-seed; drift=0 by construction
-    for key, model in models.get("cae_fixed", {}).items():
-        if isinstance(model, list):
-            continue  # skip unexpected multi-seed fixed models
-        k, lam_nonlin = key
-        r_hat = model.predict(test_ret, test_chars,
-                              train_returns=train_ret,
-                              train_chars=train_chars).astype(np.float32)
-        _, _, phi = nonlinear_contribution(model, test_ret, test_chars)
-        rows.append({
-            "config_key": f"fixed_{key}",
-            "K":          k,
-            "lam_lin":    0.0,
-            "lam_nonlin": lam_nonlin,
-            "seed":       "fixed",
-            "pred_r2":    predictive_r2(test_ret, r_hat),
-            "sharpe":     factor_sharpe(test_ret, r_hat),
-            "phi":        phi,
-            "drift":      0.0,
-        })
-
+    rows = []
+    for family in ("cae", "cae_fixed", "cae_nl"):
+        configs = models.get(family, {})
+        best = _best_key_per_k(configs, os.path.join(results_dir, f"{family}_hparam_search.pkl"))
+        for key, fitted in configs.items():
+            if not isinstance(fitted, list):
+                continue
+            for model in fitted:
+                pred = model.predict(test_ret, test_chars, train_ret, train_chars)
+                _, _, phi = nonlinear_contribution(model, test_ret, test_chars)
+                if predictions_collapsed(test_ret, pred):
+                    phi = np.nan
+                rows.append({"Model": model.model_name, "config_key": f"{family}:{key}",
+                             "K": key[0], "lam_lin": key[1] if family == "cae" else 0.0,
+                             "lam_nonlin": key[-1], "seed": model.seed,
+                             "selected_by_validation": key == best.get(key[0]),
+                             "pred_r2": predictive_r2(test_ret, pred),
+                             "sharpe": factor_sharpe(test_ret, pred), "phi": phi,
+                             "drift": compute_ipca_drift(model)})
     df = pd.DataFrame(rows)
-
-    if df.empty:
-        print("  compute_seed_stability: no multi-seed CAE models found.")
-        return df
-
-    print("\n--- Seed Stability Summary (mean ± std across seeds) ---")
-    for k in sorted(df["K"].unique()):
-        print(f"\n  K={k}")
-        for metric in ["pred_r2", "sharpe", "phi", "drift"]:
-            sub = df[df["K"] == k][metric].dropna()
-            if not sub.empty:
-                print(f"    {metric:8s}: {sub.mean():.4f} ± {sub.std():.4f}"
-                      f"  (n={len(sub)})")
-
-    os.makedirs(results_dir, exist_ok=True)
-    csv_path = os.path.join(results_dir, "seed_stability.csv")
-    df.to_csv(csv_path, index=False)
-    print(f"\n  Seed stability → {csv_path}")
-
+    if not df.empty:
+        os.makedirs(results_dir, exist_ok=True)
+        df.to_csv(os.path.join(results_dir, "seed_stability.csv"), index=False)
     return df
 
 
-def validate_ensemble_improvement(
-    splits: dict,
-    models: dict,
-    ensemble_models: dict,
-    results_dir: str = "results",
-) -> None:
-    """warns if ensemble pred R² < best single-seed pred R² for the best config. params: {splits: dict, models: dict, ensemble_models: dict, results_dir: str}. returns None."""
-    import pickle
-    from src.evaluate import predictive_r2
-
-    pkl_path = os.path.join(results_dir, "cae_multiseed_hparam_search.pkl")
-    if not os.path.exists(pkl_path):
-        return
-
-    with open(pkl_path, "rb") as f:
-        hd = pickle.load(f)
-    best_key = hd.get("best")
-    if best_key is None or best_key not in models["cae"]:
-        return
-
-    test_ret    = splits["test"]["returns"].values.astype(np.float32)
-    test_chars  = splits["test"]["chars"].astype(np.float32)
-    train_ret   = splits["train"]["returns"].values.astype(np.float32)
+def validate_ensemble_improvement(splits, models, ensemble_models, results_dir="results"):
+    """Descriptive diagnostic: averaging is not guaranteed to beat the best seed."""
+    from src.evaluate import predictive_r2, evaluation_splits, _best_key_per_k
+    splits = evaluation_splits(splits)
+    test_ret = splits["test"]["returns"].values.astype(np.float32)
+    test_chars = splits["test"]["chars"].astype(np.float32)
+    train_ret = splits["train"]["returns"].values.astype(np.float32)
     train_chars = splits["train"]["chars"].astype(np.float32)
-
-    def _r2(m):
-        r_hat = m.predict(test_ret, test_chars,
-                          train_returns=train_ret,
-                          train_chars=train_chars).astype(np.float32)
-        return predictive_r2(test_ret, r_hat)
-
-    ensemble_r2   = _r2(ensemble_models["cae"][best_key])
-    single_seed_r2 = max(_r2(m) for m in models["cae"][best_key])
-
-    if ensemble_r2 < single_seed_r2:
-        print(f"WARNING: Ensemble did not improve over single seed for "
-              f"config {best_key}.")
-        print(f"  Ensemble Pred R²:    {ensemble_r2:.4f}")
-        print(f"  Single-seed best R²: {single_seed_r2:.4f}")
-        print("  This may indicate instability in training. "
-              "Check seed_stability.csv.")
-    else:
-        print(f"  Ensemble check passed: R²={ensemble_r2:.4f} ≥ "
-              f"single-seed best {single_seed_r2:.4f}")
+    best = _best_key_per_k(models["cae"], os.path.join(results_dir, "cae_hparam_search.pkl"))
+    def score(model):
+        return predictive_r2(test_ret, model.predict(test_ret, test_chars, train_ret, train_chars))
+    for k, key in sorted(best.items()):
+        values = [score(model) for model in models["cae"][key]]
+        print(f"  K={k}: ensemble R²={score(ensemble_models['cae'][key]):.5f}; "
+              f"individual-seed mean={np.mean(values):.5f}, best={max(values):.5f}")
+    print("  Best-seed test scores are descriptive only; seeds are not selected on the test set.")
